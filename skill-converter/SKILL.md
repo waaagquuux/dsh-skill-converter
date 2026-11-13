@@ -23,7 +23,7 @@ description: 把一个外部技能包（GitHub 仓库 / 本地 zip / 本地目�
 2. 确认 Python 可用。本机优先用 DSH 自带解释器（不需要用户装 Python）：
    `C:\Users\Lenovo\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
 3. 不要把 `~/.dsh/skills` 手动建目录 —— 一律用本工具落地，这样才有 `_backup_` 快照。
-4. 如果用户自己动手、且不想碰命令行：让他双击 `dist/DSH技能转换器.exe`（本机 `E:\dsh-skill\dist\`；自带 Python，约 8.5 MB，问答式），你只需要在旁边告诉他选 1 还是 2。
+4. 如果用户自己动手、且不想碰命令行：让他双击 `dist/DSH技能转换器.exe`（本机 `E:\dsh-skill\dist\`；Release 下载的名字是 `DSH-Skill-Converter-v0.4.1.exe`，同一个程序，自带 Python，约 9.1 MB，问答式），你只需要在旁边告诉他选 1 还是 2。
 
 ## 标准流程（必须按顺序）
 

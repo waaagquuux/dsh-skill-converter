@@ -10,10 +10,12 @@
 
 | 拿到什么 | 去哪拿 |
 |---|---|
-| `DSH技能转换器.exe`（Windows，约 8.5 MB，自带 Python） | 右侧 **Releases** → 下载 `DSH技能转换器-v0.4.1.exe`，旁边有 `.sha256` 校验文件 |
+| `DSH-Skill-Converter-v0.4.1.exe`（Windows，约 9.1 MB，自带 Python 运行时） | 右侧 **Releases** → 下载 `DSH-Skill-Converter-v0.4.1.exe`，旁边有 `.exe.sha256` 校验文件 |
 | 源码（自己跑 / 改） | `git clone` 本仓库，或下载源码 zip |
 
-> **exe 没有代码签名**。所以 Windows 可能弹「Windows 已保护你的电脑」——点「更多信息」→「仍要运行」即可。校验方式：把 Release 里的 `.sha256` 和本地文件的 SHA256 比一下（`Get-FileHash .\DSH技能转换器.exe -Algorithm SHA256`）。有签名之后会更新这条说明。
+> **exe 没有代码签名**。所以 Windows 可能弹「Windows 已保护你的电脑」——点「更多信息」→「仍要运行」即可。校验方式：把 Release 里的 `.sha256` 和本地文件的 SHA256 比一下（`Get-FileHash .\DSH-Skill-Converter-v0.4.1.exe -Algorithm SHA256`）。有签名之后会更新这条说明。
+>
+> 名字说明：Release 里叫 `DSH-Skill-Converter-v0.4.1.exe`（GitHub 附件不接受中文文件名的稳定显示），你自己用 `scripts\build.ps1` 构建出来的叫 `dist\DSH技能转换器.exe`——**同一个程序**，只是文件名叫法不同。
 
 ---
 
@@ -41,7 +43,7 @@
 
 ### ② 双击 exe —— 给没有 DSH、没装 Python 的人
 
-`dist\DSH技能转换器.exe`（约 8.5 MB，单文件，**自带 Python 运行时**）。
+`DSH-Skill-Converter-v0.4.1.exe`（从 Release 下）或自己构建的 `dist\DSH技能转换器.exe`（约 9.1 MB，单文件，**自带 Python 运行时**）。
 
 双击后是问答模式：把 zip / 文件夹**拖进窗口**或粘 GitHub 链接 → 选「演习 / 装进技能目录 / 只输出」→ 结束按回车关闭。
 
@@ -50,10 +52,10 @@
 ### ③ 命令行 —— 给想批量/自动化的人
 
 ```bat
-DSH技能转换器.exe "https://github.com/anthropics/skills" --all --dry-run
-DSH技能转换器.exe "C:\path\my-skill.zip" --name my-skill --install
-DSH技能转换器.exe --undo
-DSH技能转换器.exe --list-backups
+DSH-Skill-Converter-v0.4.1.exe "https://github.com/anthropics/skills" --all --dry-run
+DSH-Skill-Converter-v0.4.1.exe "C:\path\my-skill.zip" --name my-skill --install
+DSH-Skill-Converter-v0.4.1.exe --undo
+DSH-Skill-Converter-v0.4.1.exe --list-backups
 ```
 
 ---
@@ -98,8 +100,8 @@ DSH技能转换器.exe --list-backups
 每次安装前自动写 `_backup_<时间戳>/`（含 `manifest.json`）：
 
 ```bat
-DSH技能转换器.exe --undo            :: 撤最近一批
-DSH技能转换器.exe --list-backups    :: 看有哪些批次、各撤什么
+DSH-Skill-Converter-v0.4.1.exe --undo            :: 撤最近一批
+DSH-Skill-Converter-v0.4.1.exe --list-backups    :: 看有哪些批次、各撤什么
 ```
 
 覆盖同名技能 → `--undo` 还原旧版本；新增技能 → `--undo` 把它删掉。两条路径都实测过。
