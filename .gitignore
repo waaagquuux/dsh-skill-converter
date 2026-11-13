@@ -1,0 +1,38 @@
+# 构建产物
+dist/
+.build/
+*.spec
+__pycache__/
+*.pyc
+
+# 本地虚拟环境
+.venv/
+.venv-pack/
+venv/
+
+# 运行产物（报告、落地副本、快照）
+skill-converter/output/
+skill-converter/_backup_*/
+report.html
+report-*.html
+output/
+_backup_*/
+
+# 测试夹具与临时文件
+_test/
+.dsh-vision-router/
+
+# 图标原图（AI 生成，未随仓库分发）
+fish.jpg
+
+# 只开源必须开源的：设计记录、原始需求、图标源图、生成器都不进仓库
+docs/
+scripts/make_icon.py
+assets/icon-preview.png
+
+# 原始需求文档（docx，保留在本机）
+docs/原始材料/
+
+# 个人/本机配置
+AGENTS.md
+*.log
