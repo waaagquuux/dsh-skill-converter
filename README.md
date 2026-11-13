@@ -10,7 +10,7 @@
 
 | 拿到什么 | 去哪拿 |
 |---|---|
-| `DSH-Skill-Converter-v0.4.1.exe`（Windows，约 9.1 MB，自带 Python 运行时） | 右侧 **Releases** → 下载 `DSH-Skill-Converter-v0.4.1.exe`，旁边有 `.exe.sha256` 校验文件 |
+| `DSH-Skill-Converter-v0.4.1.exe`（Windows，约 9.1 MB，自带 Python 运行时） | 👉 **[点这里下载](https://github.com/waaagquuux/dsh-skill-converter/releases/latest)**（附件旁边有 `.exe.sha256` 校验文件） |
 | 源码（自己跑 / 改） | `git clone` 本仓库，或下载源码 zip |
 
 > **exe 没有代码签名**。所以 Windows 可能弹「Windows 已保护你的电脑」——点「更多信息」→「仍要运行」即可。校验方式：把 Release 里的 `.sha256` 和本地文件的 SHA256 比一下（`Get-FileHash .\DSH-Skill-Converter-v0.4.1.exe -Algorithm SHA256`）。有签名之后会更新这条说明。
