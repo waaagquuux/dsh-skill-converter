@@ -38,17 +38,24 @@ jobs:
           $src = "dist\DSH技能转换器.exe"
           if (-not (Test-Path $src)) { throw "没找到打包产物：$src" }
 
+          # 带版本号的名字（永久指向某一版）
           $name = "DSH-Skill-Converter-$tag.exe"
           $dst  = Join-Path "dist" $name
           Copy-Item $src $dst
 
-          $hash = (Get-FileHash $dst -Algorithm SHA256).Hash
-          "$hash  $name" | Set-Content "$dst.sha256" -Encoding ascii
+          # 不带版本号的名字（配合 releases/latest/download/ 就是永久直链）
+          $stable = "DSH-Skill-Converter.exe"
+          $sdst   = Join-Path "dist" $stable
+          Copy-Item $src $sdst
 
-          Write-Host "产物：$name"
-          Write-Host "SHA256：$hash"
+          foreach ($f in @($dst, $sdst)) {
+            $hash = (Get-FileHash $f -Algorithm SHA256).Hash
+            "$hash  $(Split-Path -Leaf $f)" | Set-Content "$f.sha256" -Encoding ascii
+            Write-Host "产物：$(Split-Path -Leaf $f)  SHA256：$hash"
+          }
+
           "name=$name"     >> $env:GITHUB_OUTPUT
-          "sha256=$hash"   >> $env:GITHUB_OUTPUT
+          "stable=$sdst"   >> $env:GITHUB_OUTPUT
 
       - name: 核对 version.txt 与 tag
         if: github.ref_type == 'tag'
@@ -76,6 +83,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist/DSH-Skill-Converter.exe
+            dist/DSH-Skill-Converter.exe.sha256
             dist/${{ steps.asset.outputs.name }}
             dist/${{ steps.asset.outputs.name }}.sha256
           generate_release_notes: true
