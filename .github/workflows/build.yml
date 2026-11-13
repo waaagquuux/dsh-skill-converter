@@ -89,3 +89,18 @@ jobs:
             dist/${{ steps.asset.outputs.name }}.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
+          body: |
+            ## 下载
+
+            | 文件 | 说明 |
+            |---|---|
+            | `DSH-Skill-Converter.exe` | 永远指向最新版（[永久直链](https://github.com/${{ github.repository }}/releases/latest/download/DSH-Skill-Converter.exe)） |
+            | `DSH-Skill-Converter-${{ github.ref_name }}.exe` | 钉死这个版本 |
+            | 同名 `.sha256` | 校验值，`Get-FileHash .\DSH-Skill-Converter.exe -Algorithm SHA256` 对一下 |
+
+            ## 说明
+
+            - 这个 exe 由 GitHub Actions 在 `windows-latest` 上自动构建，不是本地手打的。
+            - **没有代码签名**：Windows 可能弹「Windows 已保护你的电脑」→ 点「更多信息」→「仍要运行」。
+            - 用法、参数、常见错误见 [README](https://github.com/${{ github.repository }}#readme)。
+            - 想不装 exe 直接用？在 DSH 里对它说一句「帮我把这个技能包装上」就行。
