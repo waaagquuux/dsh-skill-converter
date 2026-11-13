@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 先看用法说明
+    url: https://github.com/waaagquuux/dsh-skill-converter#readme
+    about: 三种用法、参数表、常见错误对照都在这里
+  - name: ⬇️ 下载最新版
+    url: https://github.com/waaagquuux/dsh-skill-converter/releases/latest
+    about: exe 和校验文件从 Releases 拿

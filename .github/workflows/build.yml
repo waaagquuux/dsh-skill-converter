@@ -1,0 +1,82 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 打包 Windows exe
+    runs-on: windows-latest
+
+    steps:
+      - name: 取源码
+        uses: actions/checkout@v4
+
+      - name: 装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装 PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: 打包（scripts/build.ps1）
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts\build.ps1
+
+      - name: 统一附件名 + 生成校验文件
+        id: asset
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_type }}" -eq "tag" ? "${{ github.ref_name }}" : "dev-${{ github.sha }}".Substring(0, 12)
+          $src = "dist\DSH技能转换器.exe"
+          if (-not (Test-Path $src)) { throw "没找到打包产物：$src" }
+
+          $name = "DSH-Skill-Converter-$tag.exe"
+          $dst  = Join-Path "dist" $name
+          Copy-Item $src $dst
+
+          $hash = (Get-FileHash $dst -Algorithm SHA256).Hash
+          "$hash  $name" | Set-Content "$dst.sha256" -Encoding ascii
+
+          Write-Host "产物：$name"
+          Write-Host "SHA256：$hash"
+          "name=$name"     >> $env:GITHUB_OUTPUT
+          "sha256=$hash"   >> $env:GITHUB_OUTPUT
+
+      - name: 核对 version.txt 与 tag
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $ver = (Select-String -Path scripts\version.txt -Pattern "StringStruct\('FileVersion','([^']+)'\)").Matches.Groups[1].Value
+          if ($ver -ne $tag) {
+            Write-Host "::warning::version.txt 里是 $ver，tag 是 $tag —— exe 属性里的版本号会和 tag 不一致"
+          } else {
+            Write-Host "版本号一致：$ver"
+          }
+
+      - name: 存成构建产物（手动运行时也能下）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.asset.outputs.name }}
+          path: |
+            dist/${{ steps.asset.outputs.name }}
+            dist/${{ steps.asset.outputs.name }}.sha256
+          if-no-files-found: error
+
+      - name: 发 Release（仅打 tag 时）
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ steps.asset.outputs.name }}
+            dist/${{ steps.asset.outputs.name }}.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
