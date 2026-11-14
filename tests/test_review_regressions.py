@@ -261,6 +261,10 @@ class InstallTests(Base):
         text = (d / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("自安装", text)
         self.assertNotIn("E:\\dsh-skill", text, "不能把作者的绝对路径带出去")
+        # 头部写的引擎路径必须是最终安装位置，不能是临时目录
+        self.assertIn(str(d / "convert.py"), text)
+        self.assertNotIn(".dsh-self-", text, "不能把 staging 临时目录写进技能说明")
+        self.assertNotIn(".dsh-stage-", text, "不能把 staging 临时目录写进技能说明")
 
     def test_readonly_skills_dir_gives_actionable_error(self):
         # 用一个不可写的“目录”模拟受限环境：拿一个已存在的文件当目录

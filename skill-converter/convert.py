@@ -2414,7 +2414,7 @@ def cmd_self_install(skills_dir: Path, dry_run: bool = False) -> int:
             header = ("本技能是「自安装」形态：引擎 `convert.py` 就在本技能目录里。\n"
                       "所有命令里的 `convert.py` 都优先用 <本技能目录>/convert.py；"
                       "本机安装时它是 "
-                      f"`{pkg / 'convert.py'}`。\n\n")
+                      f"`{dest / 'convert.py'}`。\n\n")
             write_text(pkg / "SKILL.md", header + text)
         else:
             eprint("警告：源目录没有 SKILL.md，装出来的技能不可用")
