@@ -179,6 +179,14 @@ class CompressionTests(Base):
         ok, checks = self.c.verify_compact(raw, bad)
         self.assertFalse(ok)
 
+    def test_step_content_change_rejected(self):
+        # 步骤条数不变，但把某一步要做的事换掉了（review 反例：keep→delete）
+        raw = skill_text("demo", "1. 必须备份客户数据\n2. 导出报表\n")
+        bad = skill_text("demo", "1. 必须删除客户数据\n2. 导出报表\n")
+        ok, checks = self.c.verify_compact(raw, bad)
+        self.assertFalse(ok)
+        self.assertTrue(any(not c["ok"] and "步骤" in c["label"] for c in checks), checks)
+
     def test_aggressive_truncation_is_blocked(self):
         code = "\n".join(f"echo step{i}" for i in range(1, 21))
         raw = skill_text("demo", f"```bash\n{code}\n```\n")

@@ -950,153 +950,6 @@ def esc(s):
     return html.escape(str(s))
 
 
-def _compact_stats(raw: str, packed: str) -> dict:
-    return {
-        "before_lines": raw.count("\n"), "after_lines": packed.count("\n"),
-        "before_bytes": len(raw.encode("utf-8")), "after_bytes": len(packed.encode("utf-8")),
-        "before_tokens": estimate_tokens(raw), "after_tokens": estimate_tokens(packed),
-        "saved_pct": (round(100 * (1 - estimate_tokens(packed) / estimate_tokens(raw)), 1)
-                      if estimate_tokens(raw) else 0.0),
-    }
-
-
-HARD_WORDS = ("MUST", "NEVER", "ALWAYS", "IMPORTANT", "REQUIRED", "DO NOT",
-              "必须", "不要", "禁止", "一定", "绝不")
-
-
-def _count_hard(text: str, word: str) -> int:
-    return text.count(word)
-
-
-def verify_compact(original: str, compact: str):
-    """改写版的红线校验：命令参数、硬性要求、步骤、frontmatter 都不能少。"""
-    checks = []
-
-    fm1, _ = parse_frontmatter(original)
-    fm2, _ = parse_frontmatter(compact)
-    if fm2 is None:
-        checks.append({"label": "frontmatter", "ok": False, "detail": "开头缺 --- ... --- 或缺 name/description"})
-    else:
-        same = (fm1 and fm1.get("name") == fm2.get("name")
-                and fm1.get("description") == fm2.get("description"))
-        checks.append({"label": "frontmatter", "ok": bool(same),
-                       "detail": "name、description 原样保留" if same else "name 或 description 被改了（会破坏技能识别和自动调用）"})
-
-    flags_in = set(re.findall(r"(?<![\w-])--[a-z][\w-]*", original))
-    flags_lost = sorted(f for f in flags_in if f not in compact)
-    checks.append({"label": "命令参数", "ok": not flags_lost,
-                   "detail": f"{len(flags_in)} 个参数都在" if not flags_lost
-                   else "丢了：" + "、".join(flags_lost)})
-
-    hard_lost = [w for w in HARD_WORDS if _count_hard(compact, w) < _count_hard(original, w)]
-    checks.append({"label": "硬性要求", "ok": not hard_lost,
-                   "detail": "MUST/NEVER/必须/不要 等一条没少" if not hard_lost
-                   else "变少了：" + "、".join(hard_lost)})
-
-    step_re = re.compile(r"^\s*\d+[.)]\s+\S", re.M)
-    n1, n2 = len(step_re.findall(original)), len(step_re.findall(compact))
-    checks.append({"label": "编号步骤", "ok": n2 >= n1,
-                   "detail": f"原文 {n1} 步，改写后 {n2} 步" + ("（少了就是漏内容）" if n2 < n1 else "")})
-
-    fences1, fences2 = original.count("```"), compact.count("```")
-    checks.append({"label": "示例代码", "ok": fences2 >= fences1,
-                   "detail": f"代码块 {fences1 // 2} → {fences2 // 2} 个"})
-
-    t1, t2 = estimate_tokens(original), estimate_tokens(compact)
-    checks.append({"label": "确实更省", "ok": t2 < t1,
-                   "detail": f"{t1} → {t2} Token" + ("（没省，没必要换）" if t2 >= t1 else "")})
-    return all(c["ok"] for c in checks), checks
-
-
-def verify_compact_attachment(original: str, compact: str):
-    """附件 .md 的红线校验：没有 frontmatter 就不要求 frontmatter，其余照旧。"""
-    checks = []
-
-    fm1, _ = parse_frontmatter(original)
-    if fm1 is not None:
-        fm2, _ = parse_frontmatter(compact)
-        same = bool(fm2 and fm1.get("name") == fm2.get("name")
-                    and fm1.get("description") == fm2.get("description"))
-        checks.append({"label": "frontmatter", "ok": same,
-                       "detail": "name、description 原样保留" if same else "frontmatter 被改了"})
-
-    flags_in = set(re.findall(r"(?<![\w-])--[a-z][\w-]*", original))
-    flags_lost = sorted(f for f in flags_in if f not in compact)
-    checks.append({"label": "命令参数", "ok": not flags_lost,
-                   "detail": f"{len(flags_in)} 个参数都在" if not flags_lost
-                   else "丢了：" + "、".join(flags_lost)})
-
-    hard_lost = [w for w in HARD_WORDS if _count_hard(compact, w) < _count_hard(original, w)]
-    checks.append({"label": "硬性要求", "ok": not hard_lost,
-                   "detail": "MUST/NEVER/必须/不要 等一条没少" if not hard_lost
-                   else "变少了：" + "、".join(hard_lost)})
-
-    step_re = re.compile(r"^\s*\d+[.)]\s+\S", re.M)
-    n1, n2 = len(step_re.findall(original)), len(step_re.findall(compact))
-    checks.append({"label": "编号步骤", "ok": n2 >= n1,
-                   "detail": f"原文 {n1} 步，压缩后 {n2} 步"})
-
-    fences1, fences2 = original.count("```"), compact.count("```")
-    checks.append({"label": "示例代码", "ok": fences2 >= fences1,
-                   "detail": f"代码块 {fences1 // 2} → {fences2 // 2} 个"})
-
-    t1, t2 = estimate_tokens(original), estimate_tokens(compact)
-    checks.append({"label": "确实更省", "ok": t2 < t1, "detail": f"{t1} → {t2} Token"})
-    return all(c["ok"] for c in checks), checks
-
-
-ATTACH_MAX_BYTES = 256 * 1024   # 单个附件超过 256 KB 不碰（多半是数据而不是说明文字）
-ATTACH_MIN_SAVED = 3.0          # 省不到 3% 就不生成，免得满地都是没用的 .compact.md
-
-
-def compress_attachments(sdir: Path):
-    """把技能目录里除 SKILL.md 之外的 .md 附件（refs/ 等）各压一份，只算文本、不碰图片。"""
-    out = []
-    for p in sorted(sdir.rglob("*.md")):
-        name = p.name.lower()
-        if name == "skill.md" or name.endswith(".compact.md"):
-            continue
-        try:
-            if p.stat().st_size > ATTACH_MAX_BYTES:
-                continue
-            raw = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        packed, stats = compress_text(raw)
-        if stats["saved_pct"] < ATTACH_MIN_SAVED:
-            continue
-        ok, vchecks = verify_compact_attachment(raw, packed)
-        entry = {"rel": str(p.relative_to(sdir)).replace("\\", "/"),
-                 "text": packed if ok else "", "verified": ok,
-                 "blocked": not ok, **stats}
-        if not ok:
-            entry["vdetail"] = "；".join(f"{c['label']}{'✔' if c['ok'] else '✖'}"
-                                        for c in vchecks if not c["ok"])
-        out.append(entry)
-    return out
-
-
-def _compress_detail(c: dict) -> str:
-    if c.get("verified"):
-        return "由你（或 AI）改写；命令、参数、硬性要求、步骤已逐项校验通过"
-    bits = []
-    for key, label in (("removed_dup_para", "重复段落"), ("removed_dup_line", "重复行"),
-                       ("removed_filler", "废话起句"), ("removed_section", "无用章节"),
-                       ("removed_badge", "徽章图"), ("removed_toc", "目录项"),
-                       ("removed_comment", "注释"), ("removed_blank", "多余空行"),
-                       ("trimmed_example", "超长示例")):
-        n = c.get(key, 0)
-        if n:
-            bits.append(f"{label} {n}")
-    if c.get("examples"):
-        bits.append("示例共省略 " + "、".join(c["examples"][:3]))
-    return "、".join(bits) if bits else "几乎没动（原文已经很紧凑）"
-
-
-
-# ---------------------------------------------------------------- 压缩（省 Token）
-
-# 出现这些词的行/段落一律不动：多半是命令、参数、硬性要求
 PROTECT_RE = re.compile(r"`|https?://|\b(MUST|NEVER|ALWAYS|IMPORTANT|REQUIRED|WARNING|NOTE)\b"
                         r"|^\s*(\d+[.)]|[-*+]\s|\|)")
 
@@ -1550,7 +1403,7 @@ def build_report_html(data: dict) -> str:
             if c:
                 body.append("<div class='note' style='margin-top:8px'>"
                             f"压缩：{c['before_tokens']} → {c['after_tokens']} Token（省 {c['saved_pct']}%）"
-                            + ("　已校验红线" if c.get("verified") else "")
+                            + ("　结构初筛通过" if c.get("verified") else "")
                             + f"<br>{esc(_compress_detail(c))}</div>")
             if a:
                 rows = "".join(
@@ -1605,7 +1458,7 @@ def build_report_html(data: dict) -> str:
         parts.append("<h2>压缩对比</h2>")
         for c in data["compression"]:
             saved = c.get("saved_pct", 0)
-            verified = (" <span class='badge'>已校验红线</span>" if c.get("verified") else "")
+            verified = (" <span class='badge'>结构初筛通过</span>" if c.get("verified") else "")
             parts.append(
                 f'<div class="card"><div style="font-size:16px;font-weight:600;margin-bottom:8px">'
                 f'{esc(c["name"])} <span class="badge" style="background:#1f2b1f;color:#7fe0a8">省 {saved}% Token</span>'
@@ -1632,7 +1485,7 @@ def build_report_html(data: dict) -> str:
                      "<th style='padding:6px 8px'>省</th><th style='padding:6px 8px'>校验</th></tr>")
         for c in data["attach_compression"]:
             mark = ("<span class='badge' style='background:#2b1f1f;color:#ff9c9c'>未通过，没落地</span>"
-                    if c.get("blocked") else "<span class='badge'>已校验红线</span>")
+                    if c.get("blocked") else "<span class='badge'>结构初筛通过</span>")
             parts.append(
                 f"<tr style='border-top:1px solid #1d2330'>"
                 f"<td style='padding:6px 8px' class='mono'>{esc(c['skill'])}/{esc(c['rel'])}</td>"
@@ -2025,7 +1878,7 @@ def convert(args) -> int:
                     saved = round(100 * (1 - tokens_a / tokens_b), 1) if tokens_b else 0.0
                     checks.append({"label": "附件压缩", "ok": bad_n == 0,
                                    "detail": f"{ok_n} 个 .md 附件生成了压缩版"
-                                             + (f"，{bad_n} 个没通过红线校验（不落地）" if bad_n else "")
+                                             + (f"，{bad_n} 个没通过结构初筛（不落地）" if bad_n else "")
                                              + f"；合计 {tokens_b} → {tokens_a} Token（省 {saved}%）"})
                     data["checks"] = checks
                     data["warnings"].append(
@@ -2040,7 +1893,7 @@ def convert(args) -> int:
                 data["warnings"].append(
                     "这个包本身写得很紧凑，规则压缩几乎没省下 Token。"
                     "想再省就得改写：让 AI（或你自己）改一版存成 SKILL.compact.md，"
-                    "再用 --compact-file 指给本工具，它会先校验红线再收。")
+                    "再用 --compact-file 指给本工具，它会先过结构初筛再装。")
 
         checks.append({"label": "frontmatter", "ok": True,
                        "detail": "name、description 都在；正文完整保留"})
@@ -2278,7 +2131,7 @@ def _build_parser():
     ap.add_argument("--use-compact", action="store_true",
                     help="直接把压缩版当 SKILL.md 安装（需配合 --compress 或 --compact-file）")
     ap.add_argument("--compact-file", metavar="PATH",
-                    help="用你（或 AI）改写好的 SKILL.md 当压缩版；本工具会先校验红线，改坏了直接拒绝")
+                    help="用你（或 AI）改写好的 SKILL.md 当压缩版；本工具会先过结构初筛，改坏了直接拒绝")
     ap.add_argument("--aggressive", action="store_true",
                     help="规则压缩改成有损模式（删废话起句/致谢节/截超长示例）；"
                          "过不了结构初筛就不会写进技能目录")
