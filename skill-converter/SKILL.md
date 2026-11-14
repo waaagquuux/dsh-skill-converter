@@ -7,7 +7,7 @@ description: 把一个外部技能包（GitHub 仓库 / 本地 zip / 本地目�
 
 把别人写的技能包变成 DSH 能用的技能。命令行只有一个文件：`convert.py`，只用 Python 标准库，不需要装任何依赖。
 
-**引擎位置**：本仓库的 `skill-converter/convert.py`（本机：`E:\dsh-skill\skill-converter\convert.py`，装到别处就改成本机路径）。下面所有命令里的 `convert.py` 都指这个绝对路径——引擎留在仓库里，`output/`、`_backup_`、报告也都生成在那里，不会污染技能目录。exe（`dist/DSH技能转换器.exe`，本机在 `E:\dsh-skill\dist\`）是同一个引擎的便携外壳，DSH 里有 Python，跑 `.py` 更快，不用双击 exe。
+**引擎位置**：本仓库的 skill-converter/convert.py（自安装形态下，引擎就在本技能目录里：<本技能目录>/convert.py）。下面所有命令里的 convert.py 都指它——output/、_backup_、报告默认也生成在引擎旁边，不会污染技能目录。被限制只能写工作区的 Agent：设 DSH_SKILL_HOME=<工作区目录>，或加 --skills-dir <工作区>/.dsh/skills（见 README「Windows 与受限环境」）。exe（dist/DSH技能转换器.exe）是同一个引擎的便携外壳，DSH 里有 Python 时跑 .py 更快，不用双击 exe。
 
 ## 什么时候用它
 
@@ -21,9 +21,9 @@ description: 把一个外部技能包（GitHub 仓库 / 本地 zip / 本地目�
 
 1. 确认来源是什么：`https://github.com/<owner>/<repo>`、本地 `.zip`、本地目录。
 2. 确认 Python 可用。本机优先用 DSH 自带解释器（不需要用户装 Python）：
-   `C:\Users\Lenovo\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
+   `<DSH 自带 python>`
 3. 不要把 `~/.dsh/skills` 手动建目录 —— 一律用本工具落地，这样才有 `_backup_` 快照。
-4. 如果用户自己动手、且不想碰命令行：让他双击 `dist/DSH技能转换器.exe`（本机 `E:\dsh-skill\dist\`；Release 里叫 `DSH-Skill-Converter.exe`，最新版直链，同一个程序，自带 Python，约 9 MB，问答式），你只需要在旁边告诉他选 1 还是 2。
+4. 如果用户自己动手、且不想碰命令行：让他双击 `dist/DSH技能转换器.exe`（本机 `<DSH 自带 python>`；Release 里叫 `DSH-Skill-Converter.exe`，最新版直链，同一个程序，自带 Python，约 9 MB，问答式），你只需要在旁边告诉他选 1 还是 2。
 
 ## 标准流程（必须按顺序）
 
@@ -98,10 +98,10 @@ python convert.py "<来源>" --name <名字> --compact-file "改好的.md" --ins
 
 规则：
 
-1. **先跑路线 1**。省 ≥ 5% 就够用；省不到 5% 说明这个包本来就紧凑，这时才提路线 2。
+1. **先跑路线 1**（默认保守：只删重复段落/多余空行/徽章图，不改写正文）。省 ≥ 5% 就够用；省不到 5% 说明这个包本来就紧凑，这时才提路线 2。用户明确要更狠时可以加 `--aggressive`（删整节、截超长示例），但过不了结构初筛就不会落地。一个字都没省时工具不会生成副本，别跟用户说"已压缩"。
 2. 路线 1 会连附件一起压：`refs/` 之类目录里的 `.md` 各生成一份 `<原名>.compact.md`，和原文件并排。只想要正文就加 `--no-attach`。图片、csv、pdf 永远不碰；单个附件 > 256 KB 跳过；省不到 3% 不生成。附件同样过红线校验，没过的不落盘。
 3. 走路线 2 时，你自己改写那份 `SKILL.md`：**保留 frontmatter 原文**、保留所有 `--参数`、保留 `MUST/NEVER/必须/不要` 这类硬要求、保留编号步骤的数量和顺序、保留每段代码块。
-4. 改写文件交给 `--compact-file`，工具会逐项校验；任何一项不过 → 退出码 3，**一个字都不要自己绕过**，把不过的项原样告诉用户。
+4. 改写文件交给 `--compact-file`，工具会逐项核对：frontmatter 全字段、`--参数` 完整 token、`MUST/NEVER/必须/不要` 数量、编号步骤数量、代码块逐字节。任何一项不过 → 退出码 3，**一个字都不要自己绕过**，把不过的项原样告诉用户。要跟用户说清：这是**结构遗漏初筛**，能挡"删硬要求/截代码/丢参数"，但证明不了语义等价——改写内容对不对，是人（或你）的责任。
 5. 汇报要带上前后 Token 数（例如"正文 543 → 430，省 20.8%；附件 262 → 95，省 63.7%"），别只说"压缩好了"。
 6. 压缩版和原文并排（`SKILL.compact.md`、`refs/xx.compact.md`）时，提醒用户"不喜欢就把这些文件删了，原文没动"；如果 `SKILL.md` 里写死了附件文件名，说明"AI 默认读的还是原版附件，要不要改引用由你定"。
 
@@ -112,7 +112,7 @@ python convert.py --list-backups   :: 看有哪些快照
 python convert.py --undo           :: 回滚最近一次
 ```
 
-`--undo` 按 `_backup_<时间戳>/manifest.json` 判断该删什么、该还原什么：新增的技能直接删掉，覆盖过的把旧目录还原回来。连按两次就退两步。
+`--undo` 先核对再动手：检查这一批每一项的备份是否还在、目标有没有被改过（manifest 里存了文件树指纹）。有任何冲突就**一个文件都不动**、退出码 4，把冲突列出来；用户要强撤才加 `--force`（会先把当前版本另存到 `output/_undo_keep_*/`）。没有冲突时：新增的技能直接删掉，覆盖过的把旧目录还原回来。连按两次就退两步。
 
 ## 硬性约束（不要绕过）
 
@@ -121,7 +121,8 @@ python convert.py --undo           :: 回滚最近一次
 - `.py/.js/.ts` 辅助代码会照常复制（官方技能如 pdf/docx 全靠它们干活），工具同样不运行；汇报时要带一句"随技能带了 N 个辅助代码文件，没运行"。
 - 符号链接不落地、不跟随，只在报告的「提示」里列出来。
 - 压缩包 > 5 MB、解压后 > 20 MB、文件数 > 500 直接拒绝 —— 这是防 zip 炸弹的，不要替用户放宽。
-- 写入只发生在两处：DSH 技能目录（`--install`）或本目录下的 `output/`；动手前一定先写 `_backup_<时间戳>/`。
+- 写入只发生在：DSH 技能目录（`--install`）、`--local` 的 `local-skills/`、`--output-dir` 指定的目录，或引擎旁边的 `output/`；动手前一定先写 `_backup_<时间戳>/`。
+- **宿主把 Agent 限制在工作区时**（写 `~/.dsh/skills` 报权限错）：不要硬写，改用 `--skills-dir <工作区>/.dsh/skills`、`--local` 或 `--output-dir`；想连产物/备份/报告一起搬进工作区，就让用户设 `DSH_SKILL_HOME=<工作区目录>`。
 - 不改用户已装技能的正文；压缩只写 `SKILL.compact.md`，只有 `--use-compact` 才替换 `SKILL.md`，且替换前仍走 `_backup_`。
 - 报告是单文件离线 HTML，不要往里塞外链、脚本、统计代码。
 
@@ -142,7 +143,9 @@ python convert.py --undo           :: 回滚最近一次
 | 压缩包含越界路径 | 条目里有 `../` 或绝对路径 | 不要转，告诉用户包可能有问题 |
 | 技能 X 里含可执行文件 | 选中技能目录里有 `.sh` 等 | 说明工具不复制脚本；批量模式下该技能会被跳过，要如实告知 |
 | 压缩版文件只能配一个技能用 | 给了 `--compact-file` 又要转多个技能 | 加 `--name` 挑一个，或改用 `--compress` |
-| name 与目录名不一致 | `name:` 和文件夹名不同 | 用 `--name` 指定目录名 |
+| name 与目录名不一致 | `name:` 和文件夹名不同 | 单个技能会自动按 `name` 归一化；批量时用 `--name` 单独装 |
+| 写不进 DSH 技能目录 / 没有权限 | Agent 被限制只能写工作区 | 用 `--skills-dir <工作区>\\.dsh\\skills`、`--local` 或 `--output-dir`；也可让用户设 `DSH_SKILL_HOME` |
+| 有同名技能，装进去会互相覆盖 | 包里两个技能 `name` 相同 | 先 `--name` 装一个，或让作者改名 |
 
 ## 给用户的汇报模板（智能复核）
 

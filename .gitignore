@@ -36,3 +36,6 @@ docs/原始材料/
 # 个人/本机配置
 AGENTS.md
 *.log
+feedback/
+local-test/
+local-skills/

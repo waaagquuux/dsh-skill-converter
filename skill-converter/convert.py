@@ -37,7 +37,11 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = Path(sys.executable).resolve().parent
 else:
     SCRIPT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = SCRIPT_DIR / "output"
+
+# 工作目录：output/_backup_/报告默认放在程序旁边；被限制只能写工作区的 Agent
+# 可以用 DSH_SKILL_HOME 指到它有权限的目录（程序自己可能装在只读位置）。
+APP_HOME = Path(os.environ.get("DSH_SKILL_HOME", "")).expanduser().resolve() if os.environ.get("DSH_SKILL_HOME") else SCRIPT_DIR
+OUTPUT_DIR = APP_HOME / "output"
 
 MAX_ARCHIVE_BYTES = 5 * 1024 * 1024          # 压缩包 ≤ 5 MB
 MAX_EXTRACT_BYTES = 20 * 1024 * 1024         # 解压后 ≤ 20 MB
@@ -95,6 +99,111 @@ def now_stamp() -> str:
     return _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def new_batch_id() -> str:
+    """批次 ID：同一秒内多次运行也不会撞（微秒 + 4 位随机）。"""
+    import secrets
+    return _dt.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{secrets.token_hex(2)}"
+
+
+def wp(p) -> str:
+    """Windows 长路径前缀。Python 的 open() 本身能处理长路径，但 >=260 字符时
+    某些 API 仍会失败；统一加 \\\\?\\ 前缀最稳。非 Windows 原样返回。"""
+    s = os.fspath(p)
+    if os.name != "nt":
+        return s
+    try:
+        ap = os.path.abspath(s)
+    except OSError:
+        return s
+    if ap.startswith("\\\\?\\"):
+        return ap
+    if len(ap) >= 240:
+        if ap.startswith("\\\\"):
+            return "\\\\?\\UNC\\" + ap[2:]
+        return "\\\\?\\" + ap
+    return ap
+
+
+def open_w(p):
+    return open(wp(p), "wb")
+
+
+def read_text(p) -> str:
+    with open(wp(p), "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def write_text(p, text: str):
+    Path(p).parent.mkdir(parents=True, exist_ok=True)
+    with open(wp(p), "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+# Windows 保留名：不能当目录/文件名
+_WIN_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
+                 *(f"lpt{i}" for i in range(1, 10))}
+PORTABLE_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def check_skill_name(name: str):
+    """技能名要能被 DSH 和 Windows 同时接受；返回 (ok, 原因)。"""
+    if not name:
+        return False, "名字是空的"
+    if len(name) > 64:
+        return False, "名字超过 64 个字符"
+    if name.lower() in _WIN_RESERVED:
+        return False, f"{name} 是 Windows 保留名，不能当目录名"
+    if name != name.lower():
+        return False, "只能用小写（DSH 的规范是 小写-连字符）"
+    if not PORTABLE_NAME_RE.match(name):
+        return False, "只能用小写字母、数字、连字符，且不能以连字符开头/结尾（例：code-review）"
+    return True, ""
+
+
+def tree_digest(root, ignore=("__pycache__", ".DS_Store")) -> str:
+    """目录内容指纹：相对路径 + 每个文件内容的 sha256。用于撤销前判断有没有被改过。"""
+    import hashlib
+    root = Path(root)
+    h = hashlib.sha256()
+    if not root.exists():
+        return "missing"
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root).as_posix()
+        if any(part in ignore for part in rel.split("/")):
+            continue
+        if p.is_symlink():
+            h.update(b"L" + rel.encode("utf-8"))
+            continue
+        if p.is_dir():
+            h.update(b"D" + rel.encode("utf-8"))
+            continue
+        h.update(b"F" + rel.encode("utf-8") + b"\0")
+        with open(wp(p), "rb") as f:
+            while True:
+                chunk = f.read(1024 * 256)
+                if not chunk:
+                    break
+                h.update(chunk)
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def dir_writable(p) -> bool:
+    """目标目录能不能写（不存在就往上找第一个存在的祖先）。"""
+    q = Path(p)
+    while True:
+        try:
+            if q.exists():
+                test = q / f".dsh-write-test-{os.getpid()}"
+                test.write_text("x", encoding="utf-8")
+                test.unlink()
+                return True
+            q = q.parent
+            if q == q.parent:
+                return False
+        except OSError:
+            return False
+
 # ---------------------------------------------------------------- 拒绝异常
 
 class Rejected(Exception):
@@ -114,15 +223,69 @@ def is_url(s: str) -> bool:
 
 
 def parse_github(url: str):
-    """github.com/<owner>/<repo>[/tree/<ref>[/<subdir...>]] -> (owner, repo, ref, subdir)"""
-    m = re.match(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/#?]+)(?:/(?:tree|blob)/([^/]+)(?:/(.*))?)?",
-                 url, re.I)
+    """github.com/<owner>/<repo>[/tree|blob/<ref...>[/<子目录...>]] -> (owner, repo, parts)
+
+    ref 里可能带斜杠（feature/new），所以这里只返回「tree 后面剩下的全部片段」，
+    由 fetch_github 逐个长度去试，而不是在这里硬切。
+    """
+    u = re.sub(r"[?#].*$", "", url).rstrip("/")
+    m = re.match(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)(?:/(.*))?$", u, re.I)
     if not m:
         raise Rejected("这不是可识别的 GitHub 仓库地址",
-                       "只接受 github.com/<owner>/<repo>（可带 /tree/<分支>/<子目录>）")
-    owner, repo, ref, subdir = m.group(1), m.group(2), m.group(3), m.group(4) or ""
-    repo = re.sub(r"\.git$", "", repo)
-    return owner, repo, ref, subdir.strip("/")
+                       f"{url}\n只接受 github.com/<owner>/<repo>（可带 /tree/<分支>/<子目录>）")
+    owner, repo = m.group(1), re.sub(r"\.git$", "", m.group(2))
+    rest = [p for p in (m.group(3) or "").split("/") if p]
+    parts: list[str] = []
+    if rest:
+        if rest[0] in ("tree", "blob"):
+            parts = rest[1:]
+        elif len(rest) >= 3 and rest[0] == "releases" and rest[1] == "tag":
+            parts = [rest[2]]
+        elif rest[0] in ("commit",) and len(rest) >= 2:
+            parts = [rest[1]]
+        # 其它（issues/pulls/...）当作没写 ref
+    return owner, repo, parts
+
+
+def _github_candidates(parts):
+    """把 /tree/<a>/<b>/<sub> 展开成若干 (ref, subdir) 候选，长 ref 优先。"""
+    if not parts:
+        return [("main", ""), ("master", "")]
+    cands = []
+    for k in range(len(parts), 0, -1):
+        cands.append(("/".join(parts[:k]), "/".join(parts[k:])))
+    return cands
+
+
+def fetch_github(url: str, workdir: Path):
+    owner, repo, parts = parse_github(url)
+    dest = workdir / f"{repo}.tar.gz"
+    tried = []
+    for ref, subdir in _github_candidates(parts):
+        for spec in (f"refs/heads/{ref}", f"refs/tags/{ref}", ref):
+            tar_url = f"https://codeload.github.com/{owner}/{repo}/tar.gz/{spec}"
+            try:
+                n = download(tar_url, dest)
+            except urllib.error.HTTPError as e:
+                tried.append(f"{spec} → HTTP {e.code}")
+                if e.code in (401, 403, 500, 502, 503):
+                    break
+                continue
+            except urllib.error.URLError as e:
+                raise Rejected("下载 GitHub 仓库失败",
+                               f"{e.reason}\n网络被墙/DNS 有问题时，可先手动下载 zip 再传本地路径")
+            if spec.startswith("refs/heads/"):
+                what = f"分支 {ref}"
+            elif spec.startswith("refs/tags/"):
+                what = f"标签 {ref}"
+            else:
+                what = f"提交 {ref}"
+            desc = f"github.com/{owner}/{repo} → {what}" + (f"/{subdir}" if subdir else "")
+            return ("tarball", dest, desc, subdir, n)
+    raise Rejected(
+        "下载 GitHub 仓库失败",
+        "试过这些引用都没成功：\n  " + "\n  ".join(tried[-6:])
+        + "\n检查分支/标签名，或先手动下载 zip 再传本地路径")
 
 
 def download(url: str, dest: Path, limit: int = MAX_ARCHIVE_BYTES) -> int:
@@ -148,22 +311,7 @@ def download(url: str, dest: Path, limit: int = MAX_ARCHIVE_BYTES) -> int:
     return total
 
 
-def fetch_github(url: str, workdir: Path):
-    owner, repo, ref, subdir = parse_github(url)
-    refs = [ref] if ref else ["main", "master"]
-    last_err = None
-    for r in refs:
-        tar_url = f"https://codeload.github.com/{owner}/{repo}/tar.gz/refs/heads/{r}"
-        dest = workdir / f"{repo}-{r}.tar.gz"
-        try:
-            n = download(tar_url, dest)
-            return ("tarball", dest, f"github.com/{owner}/{repo} → {r}" + (f"/{subdir}" if subdir else ""), subdir, n)
-        except urllib.error.HTTPError as e:
-            last_err = f"{tar_url} → HTTP {e.code}"
-            continue
-        except urllib.error.URLError as e:
-            raise Rejected("下载 GitHub 仓库失败", f"{e.reason}\n可先手动下载 tar.gz / zip 再传本地路径")
-    raise Rejected("下载 GitHub 仓库失败", f"分支都试过了：{last_err}\n可先手动下载再传本地路径")
+
 
 
 # ---------------------------------------------------------------- 安全解包
@@ -207,7 +355,7 @@ def _extract_zip(zf: zipfile.ZipFile, dest: Path) -> dict:
             raise Rejected("文件数超过上限", f"> {MAX_FILES} 个")
         out = dest.joinpath(*parts)
         out.parent.mkdir(parents=True, exist_ok=True)
-        with zf.open(info) as src, open(out, "wb") as dst:
+        with zf.open(info) as src, open_w(out) as dst:
             shutil.copyfileobj(src, dst, 1024 * 256)
         stats["bytes"] += info.file_size
     return stats
@@ -243,7 +391,7 @@ def _extract_tar(tf: tarfile.TarFile, dest: Path) -> dict:
         src = tf.extractfile(m)
         if src is None:
             raise Rejected("压缩包条目无法读取", f"拒绝：{m.name!r}")
-        with src, open(out, "wb") as dst:
+        with src, open_w(out) as dst:
             shutil.copyfileobj(src, dst, 1024 * 256)
         stats["bytes"] += m.size
     return stats
@@ -287,30 +435,133 @@ def copy_dir(src: Path, dest: Path) -> dict:
 FRONTMATTER_RE = re.compile(r"^---\s*(?:\r?\n)(.*?)(?:\r?\n)---\s*(?:\r?\n|$)", re.S)
 
 
+def _strip_yaml_comment(s: str) -> str:
+    """去掉 YAML 行尾注释，但引号里的 # 不算。"""
+    out, quote = [], None
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < len(s):
+                out.append(c); out.append(s[i + 1]); i += 2; continue
+            if c == quote:
+                quote = None
+            out.append(c)
+        else:
+            if c in "\"'":
+                quote = c
+                out.append(c)
+            elif c == "#" and (i == 0 or s[i - 1] in " \t"):
+                break
+            else:
+                out.append(c)
+        i += 1
+    return "".join(out).rstrip()
+
+
+_YAML_BOOL = {"true": True, "yes": True, "on": True, "false": False, "no": False, "off": False}
+
+
+def _yaml_scalar(s: str):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        inner = s[1:-1]
+        if s[0] == '"':
+            inner = inner.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
+        else:
+            inner = inner.replace("''", "'")
+        return inner
+    low = s.lower()
+    if low in _YAML_BOOL:
+        return _YAML_BOOL[low]
+    if low in ("null", "~"):
+        return None
+    if re.match(r"^-?\d+$", s):
+        try:
+            return int(s)
+        except ValueError:
+            return s
+    if s.startswith("[") and s.endswith("]"):
+        inner = s[1:-1].strip()
+        return [_yaml_scalar(x) for x in inner.split(",")] if inner else []
+    return s
+
+
+def yaml_load(block: str):
+    """够用的 YAML 子集解析：标量 / 布尔 / 数字 / 引号 / 行尾注释 / 嵌套 map / 列表 / | 块。
+
+    不追求完整 YAML（不解析锚点、tag、复杂 flow），但保证 frontmatter 里常见的写法
+    不会被当成字符串 —— 这是 review 里指出的「disable-model-invocation: true # 注释」问题。
+    """
+    entries = []
+    for raw in block.splitlines():
+        if not raw.strip():
+            continue
+        line = raw.replace("\t", "    ")
+        line = _strip_yaml_comment(line)
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        entries.append((indent, line.strip()))
+
+    root: dict = {}
+    stack = [(-1, root)]
+    i = 0
+    while i < len(entries):
+        indent, body = entries[i]
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if body.startswith("- "):
+            if isinstance(parent, list):
+                parent.append(_yaml_scalar(body[2:].strip()))
+            i += 1
+            continue
+        m = re.match(r"^([^:#]+):\s*(.*)$", body)
+        if not m:
+            i += 1
+            continue
+        key = m.group(1).strip()
+        rest = m.group(2).strip()
+        if rest in ("|", ">"):
+            buf, j = [], i + 1
+            while j < len(entries) and entries[j][0] > indent:
+                buf.append(entries[j][1])
+                j += 1
+            parent[key] = ("\n" if rest == "|" else " ").join(buf).strip()
+            i = j
+            continue
+        if rest:
+            parent[key] = _yaml_scalar(rest)
+            i += 1
+            continue
+        if i + 1 < len(entries) and entries[i + 1][0] > indent:
+            child = [] if entries[i + 1][1].startswith("- ") else {}
+            parent[key] = child
+            stack.append((indent, child))
+            i += 1
+            continue
+        parent[key] = ""
+        i += 1
+    return root
+
+
 def parse_frontmatter(text: str):
+    """返回 (frontmatter dict, 错误信息)。dict 里额外带 __raw__ = 原始 frontmatter 文本。"""
     m = FRONTMATTER_RE.match(text.lstrip("\ufeff"))
     if not m:
         return None, "文件开头没有 --- 包裹的 YAML frontmatter"
     block = m.group(1)
-    data = {}
-    key = None
-    for raw in block.splitlines():
-        line = raw.rstrip()
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        kv = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*(.*)$", line)
-        if kv:
-            key = kv.group(1)
-            val = kv.group(2).strip()
-            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-                val = val[1:-1]
-            data[key] = val
-        elif key and line.startswith((" ", "\t")):
-            data[key] = (data.get(key, "") + " " + line.strip()).strip()
-    if not data.get("name"):
-        return None, "frontmatter 里缺少 name"
-    if not data.get("description"):
-        return None, "frontmatter 里缺少 description"
+    try:
+        data = yaml_load(block)
+    except Exception as e:  # 解析器自身出问题也不要崩，按「不合法」处理
+        return None, f"frontmatter 解析失败：{e}"
+    if not isinstance(data, dict):
+        return None, "frontmatter 不是 key: value 结构"
+    for k in ("name", "description"):
+        if not data.get(k):
+            return None, f"frontmatter 里缺少 {k}"
+    data["__raw__"] = block
     return data, ""
 
 
@@ -369,35 +620,55 @@ def resolve_skills_dir(explicit: str | None) -> Path:
     return (Path.home() / ".dsh" / "skills").resolve()
 
 
-def install_skill(skill: dict, skills_dir: Path, backup_root: Path, mode: str, ts: str):
-    """mode: output | install。返回 (变更记录, 备份时间戳)。"""
-    name = skill["name"]
-    dest_root = OUTPUT_DIR if mode == "output" else skills_dir
-    dest = dest_root / name
-    change = {"name": name, "action": "added", "dest": str(dest), "backup": ""}
+def _batch_dir(backup_root: Path, ts: str) -> Path:
+    """批次备份目录：排他创建；名字撞了就加后缀，绝不覆盖别人的 manifest。"""
+    d = backup_root / f"_backup_{ts}"
+    n = 1
+    while True:
+        try:
+            d.mkdir(parents=True, exist_ok=False)
+            return d
+        except FileExistsError:
+            n += 1
+            d = backup_root / f"_backup_{ts}-{n}"
+            if n > 50:
+                raise Rejected("备份目录创建失败", f"{backup_root} 下同名批次过多")
 
-    staging = Path(tempfile.mkdtemp(prefix="dsh-skill-stage-"))
+
+def install_skill(skill: dict, dest_root: Path, batch_dir: Path, mode: str, ts: str):
+    """把技能复制进 dest_root/<name>。返回变更记录（含目录指纹）。"""
+    name = skill["name"]
+    dest = dest_root / name
+    change = {"name": name, "action": "added", "dest": str(dest), "backup": "",
+              "digest_before": "", "digest_after": ""}
+
+    dest_root.mkdir(parents=True, exist_ok=True)
+    # staging 放在目标同一文件系统里：最后的 move 才是「改个名」，不会变成跨盘复制
+    staging = Path(tempfile.mkdtemp(prefix=".dsh-stage-", dir=str(dest_root)))
     stage_dir = staging / name
     try:
         shutil.copytree(skill["dir"], stage_dir, copy_function=shutil.copyfile,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        dest_root.mkdir(parents=True, exist_ok=True)
         if dest.exists():
-            backup_dir = backup_root / f"_backup_{ts}" / name
-            backup_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(dest), str(backup_dir))
-            change["action"] = "replaced"
-            change["backup"] = str(backup_dir)
+            bdir = batch_dir / name
+            bdir.parent.mkdir(parents=True, exist_ok=True)
+            if bdir.exists():
+                bdir = bdir.parent / f"{name}-{new_batch_id()}"
+            change["digest_before"] = tree_digest(dest)
+            shutil.move(str(dest), str(bdir))
+            change.update({"action": "replaced", "backup": str(bdir),
+                           "backup_digest": tree_digest(bdir)})
         shutil.move(str(stage_dir), str(dest))
+        change["digest_after"] = tree_digest(dest)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return change, ts
 
 
-def write_backup_manifest(backup_root: Path, ts: str, record: dict):
-    d = backup_root / f"_backup_{ts}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "manifest.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+def write_backup_manifest(batch_dir: Path, record: dict):
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    write_text(batch_dir / "manifest.json", json.dumps(record, ensure_ascii=False, indent=2))
+    return batch_dir
 
 
 def list_backups(backup_root: Path):
@@ -405,7 +676,31 @@ def list_backups(backup_root: Path):
     return [p for p in items if p.is_dir()]
 
 
-def cmd_undo(backup_root: Path, skills_dir: Path, out_dir: Path) -> int:
+def _undo_plan(rec: dict):
+    """把 manifest 变成「要做什么」的清单，同时收集冲突；不动任何文件。"""
+    plan, problems = [], []
+    for ch in rec.get("changes", []):
+        dest = Path(ch.get("dest", ""))
+        act = ch.get("action")
+        item = {"change": ch, "dest": dest, "act": act, "backup": Path(ch["backup"]) if ch.get("backup") else None}
+        if act == "replaced":
+            if not item["backup"] or not item["backup"].exists():
+                problems.append(f"{ch.get('name')}：旧版本的备份不见了（{item['backup']}），"
+                                "现在还原会把当前版本换成空的")
+            else:
+                dg = ch.get("backup_digest")
+                if dg and tree_digest(item["backup"]) != dg:
+                    problems.append(f"{ch.get('name')}：备份内容被改动过，不能当作原版还原")
+        if dest.exists():
+            expect = ch.get("digest_after")
+            if expect and tree_digest(dest) != expect:
+                problems.append(f"{ch.get('name')}：装好之后这个技能被改过，"
+                                "撤销会覆盖你的修改。先自己备份，或加 --force（会把当前版本另存一份）")
+        plan.append(item)
+    return plan, problems
+
+
+def cmd_undo(backup_root: Path, skills_dir: Path, out_dir: Path, force: bool = False) -> int:
     backups = list_backups(backup_root)
     if not backups:
         print("没有可回滚的备份。")
@@ -413,267 +708,75 @@ def cmd_undo(backup_root: Path, skills_dir: Path, out_dir: Path) -> int:
     latest = backups[0]
     manifest = latest / "manifest.json"
     if not manifest.exists():
-        print(f"最新备份 {latest.name} 没有 manifest.json，无法判断该删什么。", file=sys.stderr)
-        print("请手动检查该目录。", file=sys.stderr)
+        eprint(f"最新备份 {latest.name} 没有 manifest.json，无法判断该删什么。")
+        eprint("请手动检查该目录，没动你的任何文件。")
         return EXIT_ROLLBACK
-    rec = json.loads(manifest.read_text(encoding="utf-8"))
-    changes = rec.get("changes", [])
-    problems = []
-    print(f"回滚 {latest.name}（{len(changes)} 项变更）")
-    for ch in changes:
-        dest = Path(ch["dest"])
-        if ch["action"] == "replaced" and ch.get("backup"):
-            bdir = Path(ch["backup"])
+    rec = json.loads(read_text(manifest))
+    plan, problems = _undo_plan(rec)
+    print(f"回滚 {latest.name}（{len(plan)} 项变更）")
+    if rec.get("status") == "pending":
+        problems.append("这批安装的 manifest 是「未完成」状态（上次可能中途失败），"
+                        "撤销前请确认目标目录内容")
+
+    if problems:
+        print()
+        for p in problems:
+            eprint("  ✖ " + p)
+        if not force:
+            print()
+            print("没有改动任何文件。处理办法：")
+            print("  · 想保留自己的修改：先手动备份那个技能目录，再决定要不要撤")
+            print("  · 确定要撤：加 --force（会先把当前版本另存到 _undo_keep_<时间戳>/）")
+            return EXIT_ROLLBACK
+        keep = out_dir / f"_undo_keep_{new_batch_id()}"
+        for item in plan:
+            dest = item["dest"]
             if dest.exists():
-                shutil.rmtree(dest, ignore_errors=True)
-            if bdir.exists():
+                keep.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copytree(dest, keep / dest.name, copy_function=shutil.copyfile)
+                    print(f"  · 当前版本已另存：{keep / dest.name}")
+                except OSError as e:
+                    eprint(f"  ✖ 另存当前版本失败：{e}")
+                    return EXIT_ROLLBACK
+        print("  （--force：已把当前版本另存，继续撤销）")
+
+    # 预检通过才动文件；顺序：先确认备份，再删目标，再放回备份
+    for item in plan:
+        dest, act, bdir = item["dest"], item["act"], item["backup"]
+        try:
+            if act == "replaced":
+                if not bdir or not bdir.exists():
+                    eprint(f"  ✖ {dest.name}：备份在检查之后消失了，已停止，其余未动")
+                    return EXIT_ROLLBACK
+                if dest.exists():
+                    shutil.rmtree(wp(dest), ignore_errors=False)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(bdir), str(dest))
-                print(f"  ✔ 已还原：{dest.name}（来自 {bdir.parent.name}）")
-            else:
-                problems.append(f"{dest.name}：备份不存在 {bdir}")
-        elif ch["action"] == "added":
-            if dest.exists():
-                shutil.rmtree(dest, ignore_errors=True)
-                print(f"  ✔ 已删除新增：{dest.name}")
-            else:
-                print(f"  · 已不存在：{dest.name}")
-    # 核对
-    for ch in changes:
-        dest = Path(ch["dest"])
-        if ch["action"] == "added" and dest.exists():
-            problems.append(f"{dest.name} 仍在")
-        if ch["action"] == "replaced" and not dest.exists():
-            problems.append(f"{dest.name} 未还原")
-    if problems:
-        print("\n✖ 回滚不干净：", file=sys.stderr)
-        for p in problems:
-            print("  - " + p, file=sys.stderr)
+                print(f"  ✔ 已还原：{dest.name}")
+            elif act == "added":
+                if dest.exists():
+                    shutil.rmtree(wp(dest))
+                    print(f"  ✔ 已删除新增：{dest.name}")
+                else:
+                    print(f"  · 已不存在：{dest.name}")
+        except PermissionError as e:
+            eprint(f"  ✖ 没有权限动 {dest}：{e}")
+            eprint("     技能目录被别的程序占用，或当前账号没有写权限。")
+            eprint("     关掉占用者再试；被限制在工作区时用 --skills-dir 指到工作区目录。")
+            return EXIT_ROLLBACK
+        except OSError as e:
+            eprint(f"  ✖ 撤销 {dest.name} 时出错：{e}")
+            return EXIT_ROLLBACK
+
+    bad = [item["dest"].name for item in plan
+           if (item["act"] == "replaced" and not item["dest"].exists())]
+    if bad:
+        eprint("✖ 回滚不干净：" + "、".join(bad) + "（其余已处理，备份目录保留）")
         return EXIT_ROLLBACK
     shutil.rmtree(latest, ignore_errors=True)
     print("\n✔ 回滚完成，备份目录已清理。")
     return EXIT_OK
-
-
-# ---------------------------------------------------------------- 压缩（省 Token）
-
-# 出现这些词的行/段落一律不动：多半是命令、参数、硬性要求
-PROTECT_RE = re.compile(r"`|https?://|\b(MUST|NEVER|ALWAYS|IMPORTANT|REQUIRED|WARNING|NOTE)\b"
-                        r"|^\s*(\d+[.)]|[-*+]\s|\|)")
-
-# 英文里纯属占地方的起句（只在没有反引号、不含代码的行里删）
-FILLER_PREFIXES = (
-    "please note", "note that", "it's important to", "it is important to", "keep in mind",
-    "you should note", "remember that", "as you know", "in order to", "as mentioned above",
-    "this is because", "for your information", "basically", "essentially",
-)
-
-# 整节删除：这些章节对"AI 干活"没用
-DROP_SECTION_RE = re.compile(
-    r"^#{1,6}\s*(致谢|感谢|鸣谢|贡献者|贡献指南|作者|关于我|关于本|联系|支持我|赞助|许可|协议|"
-    r"acknowledg\w*|contributors?|contact|about the author|support me|"
-    r"star this|licen[cs]e|changelog|更新日志)\b", re.I)
-
-TOC_LINE_RE = re.compile(r"^\s*[-*+]\s*\[[^\]]*\]\(#[^)]*\)\s*$")
-IMAGE_LINE_RE = re.compile(r"^\s*(\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)|!\[[^\]]*\]\([^)]*\))\s*$")
-HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
-
-
-def estimate_tokens(text: str) -> int:
-    """粗略估 token：中文按 1 字≈0.63 token，其余按 4 字符≈1 token。"""
-    cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
-    return int(round(cjk / 1.6 + (len(text) - cjk) / 3.8))
-
-
-def _norm_line(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip().lower()
-
-
-def compress_text(text: str, max_example_lines: int = 15) -> tuple[str, dict]:
-    """结构压缩：删冗余、合并重复、截超长示例。不改命令、不删步骤。"""
-    stats = {"removed_blank": 0, "removed_comment": 0, "removed_badge": 0, "removed_toc": 0,
-             "removed_section": 0, "removed_dup_line": 0, "removed_dup_para": 0,
-             "removed_filler": 0, "trimmed_example": 0, "examples": []}
-    text = HTML_COMMENT_RE.sub("", text)
-
-    lines = text.split("\n")
-    kept: list[str] = []
-    in_fence = False
-    heading_levels_seen = []
-
-    for ln in lines:
-        stripped = ln.strip()
-
-        # 代码围栏原样保留（含内部内容）
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            kept.append(ln)
-            continue
-        if in_fence:
-            kept.append(ln)
-            continue
-
-        if IMAGE_LINE_RE.match(ln):
-            stats["removed_badge"] += 1
-            continue
-        if TOC_LINE_RE.match(ln):
-            stats["removed_toc"] += 1
-            continue
-
-        kept.append(ln)
-
-    # 删"整节"后要真的把节内容也吞掉：上面只删了标题行，这里按标题块过滤
-    out_lines: list[str] = []
-    skipping_lvl = None
-    in_fence = False
-    for ln in kept:
-        stripped = ln.strip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            out_lines.append(ln)
-            continue
-        if in_fence:
-            out_lines.append(ln)
-            continue
-        if stripped.startswith("#"):
-            lvl = len(stripped) - len(stripped.lstrip("#"))
-            if skipping_lvl is not None and lvl <= skipping_lvl:
-                skipping_lvl = None
-            if DROP_SECTION_RE.match(stripped):
-                skipping_lvl = lvl
-                continue
-        if skipping_lvl is not None:
-            continue
-        out_lines.append(ln)
-    kept = out_lines
-
-    # 只剩标题、底下没内容的空章节（比如目录项被删光）也一起删掉
-    pruned: list[str] = []
-    in_fence = False
-    for i, ln in enumerate(kept):
-        st = ln.strip()
-        if st.startswith("```"):
-            in_fence = not in_fence
-            pruned.append(ln)
-            continue
-        if in_fence or not st.startswith("#"):
-            pruned.append(ln)
-            continue
-        j = i + 1
-        while j < len(kept) and kept[j].strip() == "":
-            j += 1
-        if j >= len(kept) or kept[j].strip().startswith("#"):
-            stats["removed_section"] += 1
-            continue
-        pruned.append(ln)
-    kept = pruned
-
-    # 去重行（长行、非列表、非保护行）
-    seen = set()
-    deduped = []
-    for ln in kept:
-        n = _norm_line(ln)
-        if (len(n) > 40 and not PROTECT_RE.search(ln)
-                and not n.startswith(("#", "-", "*", "|", ">"))):
-            if n in seen:
-                stats["removed_dup_line"] += 1
-                continue
-            seen.add(n)
-        deduped.append(ln)
-    kept = deduped
-
-    # 压缩空行
-    collapsed = []
-    blank = 0
-    for ln in kept:
-        if ln.strip() == "":
-            blank += 1
-            if blank > 1:
-                stats["removed_blank"] += 1
-                continue
-        else:
-            blank = 0
-        collapsed.append(ln)
-    kept = collapsed
-
-    # 去重段落 + 删占位起句（逐行处理，绝不把多行合并成一行）
-    blocks = "\n".join(kept).split("\n\n")
-    seen_para = set()
-    new_blocks = []
-    for b in blocks:
-        if not b.strip():
-            continue
-        st = b.strip()
-        # frontmatter / 代码 / 标题整块原样保留
-        if st.startswith("---") or st.startswith("```") or st.startswith("#"):
-            new_blocks.append(b)
-            continue
-        n = _norm_line(b)
-        if len(n) > 60 and not PROTECT_RE.search(b) and "\n" not in st:
-            if n in seen_para:
-                stats["removed_dup_para"] += 1
-                continue
-            seen_para.add(n)
-        # 只删"整行都以废话开头"的行，保留其余行和换行
-        kept_b = []
-        for ln in b.split("\n"):
-            s = ln.strip()
-            low = s.lower()
-            if (s and len(s) < 300 and "`" not in ln and not PROTECT_RE.search(ln)
-                    and any(low.startswith(p) for p in FILLER_PREFIXES)):
-                idx = s.find(",")
-                rest = s[idx + 1:].strip() if 0 <= idx < len(s) - 2 else ""
-                stats["removed_filler"] += 1
-                if rest:
-                    kept_b.append(rest[0].upper() + rest[1:])
-                continue
-            kept_b.append(ln)
-        if not any(x.strip() for x in kept_b):
-            continue
-        new_blocks.append("\n".join(kept_b))
-    text2 = "\n\n".join(new_blocks) + "\n"
-
-    # 截超长示例：同一技能里 > max_example_lines 行的代码块，只留前 8 行
-    out = []
-    in_fence = False
-    block: list[str] = []
-    for ln in text2.split("\n"):
-        if ln.strip().startswith("```") and not in_fence:
-            in_fence = True
-            block = [ln]
-            continue
-        if ln.strip().startswith("```") and in_fence:
-            in_fence = False
-            block.append(ln)
-            body = block[1:-1]
-            if len(body) > max_example_lines:
-                keep_n = 8
-                dropped = len(body) - keep_n
-                block = [block[0]] + body[:keep_n] + [f"…（示例省略 {dropped} 行）"] + [block[-1]]
-                stats["trimmed_example"] += 1
-                stats["examples"].append(f"{dropped} 行")
-            out.extend(block)
-            block = []
-            continue
-        if in_fence:
-            block.append(ln)
-        else:
-            out.append(ln)
-    if in_fence:  # 围栏没闭合，原样吐回去
-        out.extend(block)
-    text2 = "\n".join(out)
-
-    text2 = re.sub(r"\n{3,}", "\n\n", text2).strip() + "\n"
-    stats["before_lines"] = text.count("\n")
-    stats["after_lines"] = text2.count("\n")
-    stats["before_bytes"] = len(text.encode("utf-8"))
-    stats["after_bytes"] = len(text2.encode("utf-8"))
-    stats["before_tokens"] = estimate_tokens(text)
-    stats["after_tokens"] = estimate_tokens(text2)
-    stats["saved_pct"] = (round(100 * (1 - stats["after_tokens"] / stats["before_tokens"]), 1)
-                          if stats["before_tokens"] else 0.0)
-    return text2, stats
-
 
 # ---------------------------------------------------------------- 报告（HTML）
 
@@ -913,6 +1016,412 @@ def verify_compact_attachment(original: str, compact: str):
     t1, t2 = estimate_tokens(original), estimate_tokens(compact)
     checks.append({"label": "确实更省", "ok": t2 < t1, "detail": f"{t1} → {t2} Token"})
     return all(c["ok"] for c in checks), checks
+
+
+ATTACH_MAX_BYTES = 256 * 1024   # 单个附件超过 256 KB 不碰（多半是数据而不是说明文字）
+ATTACH_MIN_SAVED = 3.0          # 省不到 3% 就不生成，免得满地都是没用的 .compact.md
+
+
+def compress_attachments(sdir: Path):
+    """把技能目录里除 SKILL.md 之外的 .md 附件（refs/ 等）各压一份，只算文本、不碰图片。"""
+    out = []
+    for p in sorted(sdir.rglob("*.md")):
+        name = p.name.lower()
+        if name == "skill.md" or name.endswith(".compact.md"):
+            continue
+        try:
+            if p.stat().st_size > ATTACH_MAX_BYTES:
+                continue
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        packed, stats = compress_text(raw)
+        if stats["saved_pct"] < ATTACH_MIN_SAVED:
+            continue
+        ok, vchecks = verify_compact_attachment(raw, packed)
+        entry = {"rel": str(p.relative_to(sdir)).replace("\\", "/"),
+                 "text": packed if ok else "", "verified": ok,
+                 "blocked": not ok, **stats}
+        if not ok:
+            entry["vdetail"] = "；".join(f"{c['label']}{'✔' if c['ok'] else '✖'}"
+                                        for c in vchecks if not c["ok"])
+        out.append(entry)
+    return out
+
+
+def _compress_detail(c: dict) -> str:
+    if c.get("verified"):
+        return "由你（或 AI）改写；命令、参数、硬性要求、步骤已逐项校验通过"
+    bits = []
+    for key, label in (("removed_dup_para", "重复段落"), ("removed_dup_line", "重复行"),
+                       ("removed_filler", "废话起句"), ("removed_section", "无用章节"),
+                       ("removed_badge", "徽章图"), ("removed_toc", "目录项"),
+                       ("removed_comment", "注释"), ("removed_blank", "多余空行"),
+                       ("trimmed_example", "超长示例")):
+        n = c.get(key, 0)
+        if n:
+            bits.append(f"{label} {n}")
+    if c.get("examples"):
+        bits.append("示例共省略 " + "、".join(c["examples"][:3]))
+    return "、".join(bits) if bits else "几乎没动（原文已经很紧凑）"
+
+
+
+# ---------------------------------------------------------------- 压缩（省 Token）
+
+# 出现这些词的行/段落一律不动：多半是命令、参数、硬性要求
+PROTECT_RE = re.compile(r"`|https?://|\b(MUST|NEVER|ALWAYS|IMPORTANT|REQUIRED|WARNING|NOTE)\b"
+                        r"|^\s*(\d+[.)]|[-*+]\s|\|)")
+
+# 英文里纯属占地方的起句（只在没有反引号、不含代码的行里删）
+FILLER_PREFIXES = (
+    "please note", "note that", "it's important to", "it is important to", "keep in mind",
+    "you should note", "remember that", "as you know", "in order to", "as mentioned above",
+    "this is because", "for your information", "basically", "essentially",
+)
+
+# 整节删除：这些章节对"AI 干活"没用
+DROP_SECTION_RE = re.compile(
+    r"^#{1,6}\s*(致谢|感谢|鸣谢|贡献者|贡献指南|作者|关于我|关于本|联系|支持我|赞助|许可|协议|"
+    r"acknowledg\w*|contributors?|contact|about the author|support me|"
+    r"star this|licen[cs]e|changelog|更新日志)\b", re.I)
+
+TOC_LINE_RE = re.compile(r"^\s*[-*+]\s*\[[^\]]*\]\(#[^)]*\)\s*$")
+IMAGE_LINE_RE = re.compile(r"^\s*(\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)|!\[[^\]]*\]\([^)]*\))\s*$")
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+
+
+def estimate_tokens(text: str) -> int:
+    """粗略估 token：中文按 1 字≈0.63 token，其余按 4 字符≈1 token。"""
+    cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+    return int(round(cjk / 1.6 + (len(text) - cjk) / 3.8))
+
+
+def _norm_line(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def compress_text(text: str, aggressive: bool = False) -> tuple[str, dict]:
+    """保守压缩（默认）：只做不会改变语义的排版清理，绝不删句子、绝不截代码。
+
+    aggressive=True 时启用原来的有损规则（删废话起句/整节/截超长示例），
+    但它产出的东西必须先通过 verify_compact；过不了就不写进技能目录。
+    """
+    stats = {"removed_blank": 0, "removed_comment": 0, "removed_badge": 0, "removed_toc": 0,
+             "removed_section": 0, "removed_dup_line": 0, "removed_dup_para": 0,
+             "removed_filler": 0, "trimmed_example": 0, "examples": [], "mode": "aggressive" if aggressive else "conservative"}
+    if not aggressive:
+        # 只做三件事：统一行尾空白、连续空行压成一个、去掉文件末尾多余空行
+        lines = []
+        blank = 0
+        for ln in text.split("\n"):
+            ln = ln.rstrip()
+            if ln == "":
+                blank += 1
+                if blank > 1:
+                    stats["removed_blank"] += 1
+                    continue
+            else:
+                blank = 0
+            lines.append(ln)
+        text2 = "\n".join(lines).strip("\n") + "\n"
+        return _finish_stats(text, text2, stats)
+
+    n_comments = len(HTML_COMMENT_RE.findall(text))
+    stats["removed_comment"] = n_comments
+    text = HTML_COMMENT_RE.sub("", text)
+
+    lines = text.split("\n")
+    kept: list[str] = []
+    in_fence = False
+    for ln in lines:
+        stripped = ln.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            kept.append(ln)
+            continue
+        if in_fence:
+            kept.append(ln)
+            continue
+        if IMAGE_LINE_RE.match(ln):
+            stats["removed_badge"] += 1
+            continue
+        if TOC_LINE_RE.match(ln):
+            stats["removed_toc"] += 1
+            continue
+        kept.append(ln)
+
+    # 按标题层级删整节（致谢/许可/更新日志等）
+    out_lines: list[str] = []
+    skipping_lvl = None
+    in_fence = False
+    for ln in kept:
+        stripped = ln.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out_lines.append(ln)
+            continue
+        if in_fence:
+            out_lines.append(ln)
+            continue
+        if stripped.startswith("#"):
+            lvl = len(stripped) - len(stripped.lstrip("#"))
+            if skipping_lvl is not None and lvl <= skipping_lvl:
+                skipping_lvl = None
+            if DROP_SECTION_RE.match(stripped):
+                skipping_lvl = lvl
+                continue
+        if skipping_lvl is not None:
+            continue
+        out_lines.append(ln)
+    kept = out_lines
+
+    # 只剩标题、底下没内容的空章节
+    pruned: list[str] = []
+    in_fence = False
+    for i, ln in enumerate(kept):
+        st = ln.strip()
+        if st.startswith("```"):
+            in_fence = not in_fence
+            pruned.append(ln)
+            continue
+        if in_fence or not st.startswith("#"):
+            pruned.append(ln)
+            continue
+        j = i + 1
+        while j < len(kept) and kept[j].strip() == "":
+            j += 1
+        if j >= len(kept) or kept[j].strip().startswith("#"):
+            stats["removed_section"] += 1
+            continue
+        pruned.append(ln)
+    kept = pruned
+
+    # 去重行（长行、非列表、非保护行）
+    seen = set()
+    deduped = []
+    for ln in kept:
+        n = _norm_line(ln)
+        if (len(n) > 40 and not PROTECT_RE.search(ln)
+                and not n.startswith(("#", "-", "*", "|", ">"))):
+            if n in seen:
+                stats["removed_dup_line"] += 1
+                continue
+            seen.add(n)
+        deduped.append(ln)
+    kept = deduped
+
+    collapsed, blank = [], 0
+    for ln in kept:
+        if ln.strip() == "":
+            blank += 1
+            if blank > 1:
+                stats["removed_blank"] += 1
+                continue
+        else:
+            blank = 0
+        collapsed.append(ln)
+    kept = collapsed
+
+    blocks = "\n".join(kept).split("\n\n")
+    seen_para = set()
+    new_blocks = []
+    for b in blocks:
+        if not b.strip():
+            continue
+        st = b.strip()
+        if st.startswith("---") or st.startswith("```") or st.startswith("#"):
+            new_blocks.append(b)
+            continue
+        n = _norm_line(b)
+        if len(n) > 60 and not PROTECT_RE.search(b) and "\n" not in st:
+            if n in seen_para:
+                stats["removed_dup_para"] += 1
+                continue
+            seen_para.add(n)
+        kept_b = []
+        for ln in b.split("\n"):
+            s = ln.strip()
+            low = s.lower()
+            if (s and len(s) < 300 and "`" not in ln and not PROTECT_RE.search(ln)
+                    and any(low.startswith(p) for p in FILLER_PREFIXES)):
+                idx = s.find(",")
+                rest = s[idx + 1:].strip() if 0 <= idx < len(s) - 2 else ""
+                stats["removed_filler"] += 1
+                if rest:
+                    kept_b.append(rest[0].upper() + rest[1:])
+                continue
+            kept_b.append(ln)
+        if not any(x.strip() for x in kept_b):
+            continue
+        new_blocks.append("\n".join(kept_b))
+    text2 = "\n\n".join(new_blocks) + "\n"
+
+    # 截超长示例（有损；会被 verify_compact 拦下来说明不该用）
+    out = []
+    in_fence = False
+    block: list[str] = []
+    for ln in text2.split("\n"):
+        if ln.strip().startswith("```") and not in_fence:
+            in_fence = True
+            block = [ln]
+            continue
+        if ln.strip().startswith("```") and in_fence:
+            in_fence = False
+            block.append(ln)
+            body = block[1:-1]
+            if len(body) > 15:
+                keep_n = 8
+                dropped = len(body) - keep_n
+                block = [block[0]] + body[:keep_n] + [f"…（示例省略 {dropped} 行）"] + [block[-1]]
+                stats["trimmed_example"] += 1
+                stats["examples"].append(f"{dropped} 行")
+            out.extend(block)
+            block = []
+            continue
+        if in_fence:
+            block.append(ln)
+        else:
+            out.append(ln)
+    if in_fence:
+        out.extend(block)
+    text2 = "\n".join(out)
+    text2 = re.sub(r"\n{3,}", "\n\n", text2).strip() + "\n"
+    return _finish_stats(text, text2, stats)
+
+
+def _finish_stats(before: str, after: str, stats: dict):
+    stats["before_lines"] = before.count("\n")
+    stats["after_lines"] = after.count("\n")
+    stats["before_bytes"] = len(before.encode("utf-8"))
+    stats["after_bytes"] = len(after.encode("utf-8"))
+    stats["before_tokens"] = estimate_tokens(before)
+    stats["after_tokens"] = estimate_tokens(after)
+    stats["saved_pct"] = (round(100 * (1 - stats["after_tokens"] / stats["before_tokens"]), 1)
+                          if stats["before_tokens"] else 0.0)
+    return after, stats
+
+
+def _compact_stats(raw: str, packed: str) -> dict:
+    return {
+        "before_lines": raw.count("\n"), "after_lines": packed.count("\n"),
+        "before_bytes": len(raw.encode("utf-8")), "after_bytes": len(packed.encode("utf-8")),
+        "before_tokens": estimate_tokens(raw), "after_tokens": estimate_tokens(packed),
+        "saved_pct": (round(100 * (1 - estimate_tokens(packed) / estimate_tokens(raw)), 1)
+                      if estimate_tokens(raw) else 0.0),
+    }
+
+
+HARD_WORDS = ("MUST", "NEVER", "ALWAYS", "IMPORTANT", "REQUIRED", "DO NOT",
+              "必须", "不要", "禁止", "一定", "绝不")
+
+FENCE_RE = re.compile(r"^[ \t]*```[^\n]*\n(.*?)^[ \t]*```", re.S | re.M)
+
+
+def _count_hard(text: str, word: str) -> int:
+    return text.count(word)
+
+
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _code_blocks(text: str):
+    """取出所有 fenced code block 的正文（忽略围栏语言标记），用于逐字节比对。"""
+    blocks = []
+    for b in FENCE_RE.findall(text):
+        blocks.append("\n".join(line.rstrip() for line in b.strip("\n").splitlines()))
+    return blocks
+
+
+def _hard_sentences(text: str):
+    """含 MUST/必须 等硬性要求的行，去掉空白差异后作为「必须逐字保留」的单位。"""
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("```"):
+            continue
+        if any(w in s for w in HARD_WORDS):
+            n = _norm_ws(s)
+            if len(n) >= 8:
+                out.append(n)
+    return out
+
+
+def _step_lines(text: str):
+    return [_norm_ws(line) for line in text.splitlines()
+            if re.match(r"^\s*\d+[.)]\s+\S", line)]
+
+
+def _fm_values(fm: dict):
+    return {k: str(v).strip() for k, v in (fm or {}).items() if k != "__raw__"}
+
+
+def verify_compact(original: str, compact: str, require_frontmatter: bool = True):
+    """结构初筛（不是语义等价证明）：frontmatter/参数/硬性句子/步骤/代码块都要原样在。
+
+    - frontmatter：所有字段（含 disable-model-invocation 这类控制字段）值必须一致
+    - 命令参数：按完整 token 比对（--name 不会因为 --namespace 存在就算「还在」）
+    - 硬性要求：原文每条含 MUST/必须 的句子，必须在改写版里逐字找到
+    - 编号步骤：每条原步骤也要能逐字找到（不许只数条数）
+    - 代码块：逐字节相同（只容忍行尾空白差异）
+    """
+    checks = []
+    fm1, _ = parse_frontmatter(original)
+    fm2, _ = parse_frontmatter(compact)
+    if require_frontmatter or fm1 is not None:
+        if fm2 is None:
+            checks.append({"label": "frontmatter", "ok": False,
+                           "detail": "开头缺 --- ... --- 或缺 name/description"})
+        else:
+            v1, v2 = _fm_values(fm1), _fm_values(fm2)
+            diffs = sorted(k for k in set(v1) | set(v2) if v1.get(k) != v2.get(k))
+            checks.append({
+                "label": "frontmatter", "ok": not diffs,
+                "detail": "所有字段（含控制字段）原样保留" if not diffs
+                else "被改了：" + "、".join(diffs)})
+
+    flags1 = set(re.findall(r"(?<![\w-])--[a-z][\w-]*", original))
+    flags2 = set(re.findall(r"(?<![\w-])--[a-z][\w-]*", compact))
+    lost = sorted(flags1 - flags2)
+    checks.append({"label": "命令参数", "ok": not lost,
+                   "detail": f"{len(flags1)} 个参数按完整名字比对，都在" if not lost
+                   else "丢了：" + "、".join(lost)})
+
+    hard = _hard_sentences(original)
+    ncompact = _norm_ws(compact)
+    missing_hard = [s for s in hard if s not in ncompact]
+    checks.append({"label": "硬性要求", "ok": not missing_hard,
+                   "detail": f"{len(hard)} 条硬性要求原句都在" if not missing_hard
+                   else f"{len(missing_hard)} 条被改了/删了（初筛只看字面，改写过就不能用）"})
+
+    steps = _step_lines(original)
+    missing_steps = [s for s in steps if s not in ncompact]
+    checks.append({"label": "编号步骤", "ok": not missing_steps,
+                   "detail": f"{len(steps)} 条步骤都在" if not missing_steps
+                   else f"{len(missing_steps)} 条步骤找不到（不许只数条数）"})
+
+    cb1 = _code_blocks(original)
+    cb2 = _code_blocks(compact)
+    missing_cb = [b for b in cb1 if b not in cb2]
+    checks.append({"label": "示例代码", "ok": not missing_cb,
+                   "detail": f"{len(cb1)} 个代码块逐字节一致" if not missing_cb
+                   else f"{len(missing_cb)} 个代码块被改过（命令/代码必须原样）"})
+
+    t1, t2 = estimate_tokens(original), estimate_tokens(compact)
+    checks.append({"label": "确实更省", "ok": t2 < t1,
+                   "detail": f"{t1} → {t2} Token" + ("（没省，没必要换）" if t2 >= t1 else "")})
+    return all(c["ok"] for c in checks), checks
+
+
+def _blocking(checks):
+    """哪些初筛项真的会阻止落地。「确实更省」只算提示：不省就别用，但不算改坏。"""
+    return [c for c in checks if not c["ok"] and c["label"] != "确实更省"]
+
+
+def verify_compact_attachment(original: str, compact: str):
+    """附件 .md：没有 frontmatter 就不查 frontmatter，其余规则与 SKILL.md 相同。"""
+    return verify_compact(original, compact, require_frontmatter=False)
 
 
 ATTACH_MAX_BYTES = 256 * 1024   # 单个附件超过 256 KB 不碰（多半是数据而不是说明文字）
@@ -1220,9 +1729,9 @@ def scan_files(root: Path):
 
 def convert(args) -> int:
     workdir = Path(tempfile.mkdtemp(prefix="dsh-skill-conv-"))
-    report_dir = SCRIPT_DIR
+    report_dir = APP_HOME
     skills_dir = resolve_skills_dir(args.skills_dir)
-    backup_root = SCRIPT_DIR
+    backup_root = APP_HOME
     data = {
         "status": "ok",
         "generated_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1313,9 +1822,24 @@ def convert(args) -> int:
                 if fm is None:
                     raise Rejected("SKILL.md 不合法", err, [])
                 if fm["name"] != s["name"]:
-                    raise Rejected(
-                        f"frontmatter 里的 name（{fm['name']}）与目录名（{s['name']}）不一致",
-                        "DSH 要求两者一致；让作者改名，或用 --name 单独指定另一个版本", [])
+                    okn, why = check_skill_name(str(fm["name"]))
+                    if not okn:
+                        raise Rejected(
+                            f"frontmatter 里的 name（{fm['name']}）不能用",
+                            why, [])
+                    if len(picked) == 1:
+                        data["warnings"].append(
+                            f"包里的目录名（{s['name']}）和 frontmatter 的 name（{fm['name']}）不一致，"
+                            f"已按 frontmatter 归一化成 {fm['name']}（DSH 只认这一层）")
+                        s["name"] = str(fm["name"])
+                    else:
+                        raise Rejected(
+                            f"frontmatter 里的 name（{fm['name']}）与目录名（{s['name']}）不一致",
+                            "批量转换时无法判断该用哪个；让作者改名，或用 --name 单独装这一个", [])
+                else:
+                    okn, why = check_skill_name(str(fm["name"]))
+                    if not okn:
+                        raise Rejected(f"技能名不能用：{fm['name']}", why, [])
             except Rejected as r:
                 if not batch:
                     raise Rejected(f"技能 {s['name']}：{r.reason}", r.detail, checks)
@@ -1342,6 +1866,19 @@ def convert(args) -> int:
         if not data["skills"]:
             raise Rejected("所有技能都没通过检查，一个都没转",
                            f"共 {len(picked)} 个技能全部有问题，详见下面的清单", checks)
+        # 平铺后重名会互相覆盖：装之前就拒绝，而不是让第二个悄悄盖掉第一个
+        seen_names: dict[str, str] = {}
+        dups = []
+        for s in data["skills"]:
+            if s["name"] in seen_names:
+                dups.append(f"{s['name']}（{seen_names[s['name']]} 与 {s['source_path']}）")
+            seen_names[s["name"]] = s["source_path"]
+        if dups:
+            raise Rejected(
+                "有同名技能，装进去会互相覆盖",
+                "重名：" + "、".join(dups) +
+                "\n可以：① 先只装其中一个（--name <名字>）② 让作者把 frontmatter 的 name 改成不同值"
+                " ③ 分开装到不同 --skills-dir", checks)
         if data["skipped"]:
             data["warnings"].append(
                 f"有 {len(data['skipped'])} 个技能没通过检查、已跳过（其余照常转换）："
@@ -1383,15 +1920,16 @@ def convert(args) -> int:
         if args.compress or args.compact_file:
             cbase = workdir / "_compact"
             for s in data["skills"]:
-                raw = (s["dir"] / "SKILL.md").read_text(encoding="utf-8", errors="replace")
+                raw = read_text(s["dir"] / "SKILL.md")
                 if args.compact_file:
                     cp = Path(args.compact_file).expanduser()
                     if not cp.is_file():
                         raise Rejected("找不到你指定的压缩版文件", str(cp), checks)
-                    packed = cp.read_text(encoding="utf-8", errors="replace")
-                    ok, vchecks = verify_compact(raw, packed)
+                    packed = read_text(cp)
+                    ok_all, vchecks = verify_compact(raw, packed)
+                    ok = not _blocking(vchecks)
                     checks.append({
-                        "label": "压缩版红线校验", "ok": ok,
+                        "label": "结构初筛（改写版）", "ok": ok,
                         "detail": "；".join(f"{c['label']}{'✔' if c['ok'] else '✖'}" for c in vchecks)})
                     data["checks"] = checks
                     if not ok:
@@ -1401,8 +1939,33 @@ def convert(args) -> int:
                                       for c in vchecks if not c["ok"]), checks)
                     cstats = _compact_stats(raw, packed)
                     cstats["verified"] = True
+                    cstats["vchecks"] = vchecks
                 else:
-                    packed, cstats = compress_text(raw)
+                    packed, cstats = compress_text(raw, aggressive=bool(getattr(args, "aggressive", False)))
+                    ok_all, vchecks = verify_compact(raw, packed)
+                    ok = not _blocking(vchecks)
+                    cstats["verified"] = ok
+                    cstats["vchecks"] = vchecks
+                    checks.append({
+                        "label": "结构初筛（规则压缩）", "ok": ok,
+                        "detail": "；".join(f"{c['label']}{'✔' if c['ok'] else '✖'}" for c in vchecks)})
+                    data["checks"] = checks
+                    if not ok:
+                        msg = ("规则压缩没通过结构初筛（保守模式也会拦），没有生成压缩版；原文照装。"
+                               "要在省 Token 上再进一步，用 AI 改一版再用 --compact-file 交回来校验。")
+                        if args.use_compact:
+                            raise Rejected("规则压缩没通过结构初筛，不敢用它替换 SKILL.md", msg, checks)
+                        data["warnings"].append(msg)
+                        s["compact"] = cstats
+                        data["compression"].append({"name": s["name"], **cstats})
+                        continue
+                    if cstats["saved_pct"] < 1.0 and not args.compact_file:
+                        # 一个字都没省下来：不必生成一份内容一样的副本
+                        data["warnings"].append(
+                            "规则压缩没省下 Token（这个技能本来就紧凑），所以没有生成 SKILL.compact.md；原文照装。")
+                        s["compact"] = cstats
+                        data["compression"].append({"name": s["name"], **cstats})
+                        continue
                 s["compact_text"] = packed
                 s["compact"] = cstats
                 data["compression"].append({"name": s["name"], **cstats})
@@ -1460,10 +2023,39 @@ def convert(args) -> int:
                                     "只能你手动 /名字 使用（本工具不擅自改这个字段）。")
 
         mode = "install" if args.install else "output"
-        dest_note = str(skills_dir) if mode == "install" else str(OUTPUT_DIR)
-        ts = getattr(args, "_ts", "") or now_stamp()
+        out_override = getattr(args, "output_dir", None)
+        dest_root = (Path(out_override).expanduser().resolve() if out_override
+                     else (skills_dir if mode == "install" else OUTPUT_DIR))
+        dest_root = Path(dest_root)
+        dest_note = str(dest_root)
+        ts = getattr(args, "_ts", "") or new_batch_id()
+
+        if mode == "install" and not args.dry_run and not dir_writable(dest_root):
+            raise Rejected(
+                "写不进 DSH 技能目录",
+                f"{dest_root}\n"
+                "常见原因：① Agent 被限制只能写工作区 ② 目录被占用 ③ 当前账号没有写权限\n"
+                "办法：\n"
+                "  · 装到工作区内：--skills-dir <你的工作区>/.dsh/skills\n"
+                "  · 只输出到本地：去掉 --install（产物在程序旁边的 output/）\n"
+                "  · 让程序把临时文件也放在工作区：设环境变量 DSH_SKILL_HOME=<工作区目录>", checks)
+
+        batch_dir = None
+        if not args.dry_run:
+            batch_dir = _batch_dir(backup_root, ts)
+            write_backup_manifest(batch_dir, {
+                "status": "pending",
+                "createdAt": data["generated_at"],
+                "source": desc,
+                "mode": mode,
+                "destRoot": str(dest_root),
+                "changes": [{"name": s["name"], "action": "added", "dest": str(dest_root / s["name"]),
+                             "backup": ""} for s in data["skills"]],
+                "note": "这批还没装完；如果程序中途出错，--undo 会按这里记录的清单修复",
+            })
+
         for s in data["skills"]:
-            target = Path(dest_note) / s["name"]
+            target = dest_root / s["name"]
             s["dest"] = str(target)
             ch = {"name": s["name"],
                   "action": ("would-replace" if target.exists() else "would-add") if args.dry_run
@@ -1472,12 +2064,22 @@ def convert(args) -> int:
             if args.dry_run:
                 data["changes"].append(ch)
                 continue
-            real, ts_used = install_skill(s, skills_dir, backup_root, mode, ts)
+            try:
+                real, ts_used = install_skill(s, dest_root, batch_dir, mode, ts)
+            except PermissionError as e:
+                eprint(f"\n✖ 没有权限写 {dest_root}：{e}")
+                eprint("   已经装进去的部分可以 --undo 回滚；被限制在工作区时请改用 --skills-dir。")
+                raise Rejected("写不进目标目录（权限）",
+                               f"{dest_root}\n{e}\n已写入的部分可用 --undo 回滚；"
+                               "被限制在工作区时可加 --skills-dir <工作区>/.dsh/skills", checks)
+            except OSError as e:
+                raise Rejected("写目标目录失败", f"{dest_root}\n{e}", checks)
             data["changes"].append(real)
             if args.compress and not args.use_compact:
+                if not s.get("compact_text"):
+                    continue
                 try:
-                    (Path(real["dest"]) / "SKILL.compact.md").write_text(
-                        s["compact_text"], encoding="utf-8")
+                    write_text(Path(real["dest"]) / "SKILL.compact.md", s["compact_text"])
                 except OSError as e:
                     data["warnings"].append(f"压缩版没写进去：{e}")
             for e in s.get("attach_compacts", []):
@@ -1497,11 +2099,14 @@ def convert(args) -> int:
             data["reason"] = f"会新增/覆盖到 {dest_note}；确认无误后去掉 --dry-run 再跑一次"
             data["undo"] = ""
         else:
-            write_backup_manifest(backup_root, ts, {
+            write_backup_manifest(batch_dir, {
+                "status": "done",
                 "createdAt": data["generated_at"],
                 "source": desc,
+                "mode": mode,
+                "destRoot": str(dest_root),
                 "changes": data["changes"],
-                "note": "本文件用于 --undo 判断该删什么、该还原什么",
+                "note": "本文件用于 --undo：核对备份与目标指纹后，删除新增 / 还原被覆盖的",
             })
             data["status"] = "ok"
             n = len(data["skills"])
@@ -1581,8 +2186,10 @@ def print_result(data: dict):
             print(f"   装到：{s['dest']}")
         if s.get("compact"):
             c = s["compact"]
-            print(f"   压缩：{c['before_tokens']} → {c['after_tokens']} Token（省 {c['saved_pct']}%）"
-                  + ("，已按压缩版安装" if s.get("compact_used") else "，压缩版另存为 SKILL.compact.md"))
+            tail = ("，已按压缩版安装" if s.get("compact_used")
+                    else ("，压缩版另存为 SKILL.compact.md" if s.get("compact_text")
+                          else "，没生成压缩版（原文照装）"))
+            print(f"   压缩：{c['before_tokens']} → {c['after_tokens']} Token（省 {c['saved_pct']}%）" + tail)
     for ch in data["changes"]:
         if ch.get("backup"):
             print(f"   备份：{ch['backup']}")
@@ -1626,8 +2233,16 @@ def _build_parser():
     ap.add_argument("--no-report", action="store_true", help="不生成 report.html")
     ap.add_argument("--open", action="store_true", help="生成后用默认浏览器打开报告")
     ap.add_argument("--undo", action="store_true", help="还原最近一次备份")
+    ap.add_argument("--force", action="store_true",
+                    help="配合 --undo：检测到冲突也继续（会先把当前版本另存到 _undo_keep_*/）")
     ap.add_argument("--list-backups", action="store_true", help="列出备份")
     ap.add_argument("--skills-dir", help="技能目录（默认 $DSH_HOME/skills 或 ~/.dsh/skills）")
+    ap.add_argument("--local", action="store_true",
+                    help="装到程序旁边的 local-skills/（Agent 被限制只能写工作区时用）")
+    ap.add_argument("--output-dir", metavar="PATH",
+                    help="不装技能目录，只把产物放到这个目录（相当于 --output 的自定义路径）")
+    ap.add_argument("--self-install", action="store_true",
+                    help="把本工具自己装成一个 DSH 技能（引擎跟着技能目录走，不再依赖作者电脑的路径）")
     ap.add_argument("--compress", action="store_true",
                     help="生成压缩版（删重复/空行/徽章图/目录/废话起句、截超长示例）：SKILL.md 另存为 SKILL.compact.md，"
                          "refs/ 等目录里的 .md 附件也各生成一份 <原名>.compact.md")
@@ -1637,6 +2252,9 @@ def _build_parser():
                     help="直接把压缩版当 SKILL.md 安装（需配合 --compress 或 --compact-file）")
     ap.add_argument("--compact-file", metavar="PATH",
                     help="用你（或 AI）改写好的 SKILL.md 当压缩版；本工具会先校验红线，改坏了直接拒绝")
+    ap.add_argument("--aggressive", action="store_true",
+                    help="规则压缩改成有损模式（删废话起句/致谢节/截超长示例）；"
+                         "过不了结构初筛就不会写进技能目录")
     return ap
 
 
@@ -1764,6 +2382,64 @@ def run_sources(args) -> int:
     return status
 
 
+def cmd_self_install(skills_dir: Path, dry_run: bool = False) -> int:
+    """把本工具自己装成一个技能：引擎 convert.py 跟着技能目录走，不再指向作者电脑的路径。"""
+    name = "skill-converter"
+    engine = SCRIPT_DIR / "convert.py"
+    if not engine.exists():
+        eprint(f"找不到引擎文件：{engine}")
+        eprint("自安装需要 convert.py 和 SKILL.md 在同一个目录（Release 的 exe 版本不支持自安装，")
+        eprint("请用源码版，或直接把 exe 放到 PATH 里用）。")
+        return EXIT_ROLLBACK
+    dest = skills_dir / name
+    print(f"把本工具装成技能：{dest}")
+    if dry_run:
+        print("（--dry-run：什么都没写）")
+        for f in ("convert.py", "SKILL.md", "README.md"):
+            p = SCRIPT_DIR / f
+            print(f"  · {f}：{'有' if p.exists() else '缺（跳过）'}")
+        return EXIT_OK
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    ts = new_batch_id()
+    tmp = Path(tempfile.mkdtemp(prefix=".dsh-self-", dir=str(skills_dir)))
+    pkg = tmp / name
+    try:
+        pkg.mkdir(parents=True)
+        shutil.copyfile(wp(engine), wp(pkg / "convert.py"))
+        skill_md = SCRIPT_DIR / "SKILL.md"
+        if skill_md.exists():
+            text = read_text(skill_md)
+            text = text.replace(str(engine), "<本技能目录>/convert.py")
+            text = text.replace(str(SCRIPT_DIR), "<本技能目录>")
+            header = ("本技能是「自安装」形态：引擎 `convert.py` 就在本技能目录里。\n"
+                      "所有命令里的 `convert.py` 都优先用 <本技能目录>/convert.py；"
+                      "本机安装时它是 "
+                      f"`{pkg / 'convert.py'}`。\n\n")
+            write_text(pkg / "SKILL.md", header + text)
+        else:
+            eprint("警告：源目录没有 SKILL.md，装出来的技能不可用")
+        if (SCRIPT_DIR / "README.md").exists():
+            shutil.copyfile(wp(SCRIPT_DIR / "README.md"), wp(pkg / "README.md"))
+        batch_dir = _batch_dir(APP_HOME, ts)
+        write_backup_manifest(batch_dir, {
+            "status": "pending", "createdAt": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "self-install", "mode": "install", "destRoot": str(skills_dir),
+            "changes": [{"name": name, "action": "added", "dest": str(dest), "backup": ""}],
+        })
+        ch, _ = install_skill({"dir": pkg, "name": name}, skills_dir, batch_dir, "install", ts)
+        write_backup_manifest(batch_dir, {
+            "status": "done", "createdAt": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "self-install", "mode": "install", "destRoot": str(skills_dir),
+            "changes": [ch], "note": "自安装：引擎随技能目录",
+        })
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"✔ 已装好：{dest}")
+    print(f"   引擎：{dest / 'convert.py'}")
+    print("   撤销：--undo")
+    return EXIT_OK
+
+
 def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1785,27 +2461,35 @@ def main(argv=None) -> int:
     if len(sources) > 1 and (args.name or args.compact_file):
         ap.error("给了多个来源时，不能用 --name 或 --compact-file（它们只针对单个技能）")
 
+    if args.local:
+        args.install = True
+        if not args.skills_dir:
+            args.skills_dir = str(APP_HOME / "local-skills")
+
     if args.undo:
-        return cmd_undo(SCRIPT_DIR, resolve_skills_dir(args.skills_dir), OUTPUT_DIR)
+        return cmd_undo(APP_HOME, resolve_skills_dir(args.skills_dir), OUTPUT_DIR, force=args.force)
+    if args.self_install:
+        return cmd_self_install(resolve_skills_dir(args.skills_dir), dry_run=args.dry_run)
     if args.list_backups:
-        bs = list_backups(SCRIPT_DIR)
+        bs = list_backups(APP_HOME)
         if not bs:
             print("没有备份。")
         for b in bs:
-            n = len(list((b).rglob("*"))) // 2 if b.exists() else 0
-            extra = ""
             man = b / "manifest.json"
-            label = f"（{n} 项）"
+            label = ""
+            extra = ""
             if man.exists():
                 try:
-                    rec = json.loads(man.read_text(encoding="utf-8"))
+                    rec = json.loads(read_text(man))
                     chs = rec.get("changes", [])
+                    label = f"（{len(chs)} 项变更）"
+                    if rec.get("status") == "pending":
+                        label += "  ⚠ 未完成"
                     added = [c["name"] for c in chs if c.get("action") == "added"]
-                    if n == 0 and added:
-                        label = f"（新增 {len(added)} 个，无旧版本）"
-                        extra = "  --undo 会把它们删掉：" + "、".join(added)
+                    if added:
+                        extra = "  --undo 会删掉：" + "、".join(added)
                 except Exception:
-                    pass
+                    label = "（manifest 读不了）"
             print(f"{b.name}  {label}{extra}")
         return EXIT_OK
     if not sources:
@@ -1816,15 +2500,9 @@ def main(argv=None) -> int:
         ap.print_help()
         return EXIT_ARGS
 
-    sources = list(args.source)
     if len(sources) > 1 and (args.name or args.compact_file):
         ap.error("给了多个来源时，不能用 --name 或 --compact-file（它们只针对单个技能）")
 
-    sources = list(args.source)
-    if len(sources) > 1 and (args.name or args.compact_file):
-        ap.error("给了多个来源时，不能用 --name 或 --compact-file（它们只针对单个技能）")
-
-    # 让 finally 里能读到 data：直接内联
     return run_sources(args)
 
 
