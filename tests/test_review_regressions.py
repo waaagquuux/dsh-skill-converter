@@ -277,6 +277,26 @@ class InstallTests(Base):
         self.assertIn(p.returncode, (3, 4), p.stdout + p.stderr)
         self.assertIn("写", p.stdout + p.stderr)
 
+    def test_truncated_archive_gives_clean_error(self):
+        # 下载被中断的 tar.gz：必须给可读的拒绝理由，不能抛 Python traceback
+        import io
+        import tarfile
+
+        src = self.tmp / "src"
+        self.make_skill(src / "demo", "demo")
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            tf.add(str(src / "demo"), arcname="demo")
+        data = buf.getvalue()
+        broken = self.tmp / "broken.tar.gz"
+        broken.write_bytes(data[: len(data) // 2])
+
+        p = self.run_cli(broken, "--dry-run", "--no-report")
+        out = (p.stdout or "") + (p.stderr or "")
+        self.assertEqual(p.returncode, 3, out)
+        self.assertNotIn("Traceback", out, "不能把 traceback 甩给用户")
+        self.assertTrue("完整" in out or "解压" in out, out)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

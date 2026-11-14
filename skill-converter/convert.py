@@ -288,27 +288,47 @@ def fetch_github(url: str, workdir: Path):
         + "\n检查分支/标签名，或先手动下载 zip 再传本地路径")
 
 
-def download(url: str, dest: Path, limit: int = MAX_ARCHIVE_BYTES) -> int:
+def download(url: str, dest: Path, limit: int = MAX_ARCHIVE_BYTES, attempts: int = 3) -> int:
+    """下载到 dest。校验长度，短读就重试——网络上截断的包会让解压阶段报 EOFError。"""
     req = urllib.request.Request(url, headers={
         "User-Agent": "dsh-skill-converter/0.1 (+https://github.com)",
         "Accept": "application/octet-stream, application/x-gzip, */*",
     })
-    total = 0
-    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
-        length = resp.headers.get("Content-Length")
-        if length and int(length) > limit:
-            raise Rejected(f"下载体积超过上限（{human_size(int(length))} > {human_size(limit)}）",
-                           "为避免拖爆磁盘，超过 5 MB 的包需先自行下载再传本地路径")
-        while True:
-            chunk = resp.read(64 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > limit:
-                raise Rejected(f"下载体积超过上限（> {human_size(limit)}）",
-                               "为避免拖爆磁盘，超过 5 MB 的包需先自行下载再传本地路径")
-            f.write(chunk)
-    return total
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        total = 0
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
+                length = resp.headers.get("Content-Length")
+                expect = int(length) if length else 0
+                if expect and expect > limit:
+                    raise Rejected(f"下载体积超过上限（{human_size(expect)} > {human_size(limit)}）",
+                                   "为避免拖爆磁盘，超过 5 MB 的包需先自行下载再传本地路径")
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise Rejected(f"下载体积超过上限（> {human_size(limit)}）",
+                                       "为避免拖爆磁盘，超过 5 MB 的包需先自行下载再传本地路径")
+                    f.write(chunk)
+            if expect and total != expect:
+                last_err = f"只收到 {human_size(total)}，应为 {human_size(expect)}"
+                if attempt < attempts:
+                    continue
+                raise Rejected(f"下载不完整（{last_err}）",
+                               "网络被中断了；重试一次，或先手动下载 zip 再传本地路径")
+            return total
+        except Rejected:
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError, EOFError, OSError) as e:
+            last_err = str(e)
+            if attempt < attempts:
+                continue
+            raise Rejected(f"下载失败：{last_err}",
+                           "检查网络/代理；也可以先手动下载 zip，再用本地路径转换")
+    raise Rejected(f"下载失败：{last_err}", "检查网络/代理，或改用本地 zip")
 
 
 
@@ -399,14 +419,21 @@ def _extract_tar(tf: tarfile.TarFile, dest: Path) -> dict:
 
 def safe_extract(archive: Path, dest: Path) -> dict:
     dest.mkdir(parents=True, exist_ok=True)
-    if zipfile.is_zipfile(archive):
-        with zipfile.ZipFile(archive) as zf:
-            return _extract_zip(zf, dest)
     try:
+        if zipfile.is_zipfile(archive):
+            with zipfile.ZipFile(archive) as zf:
+                return _extract_zip(zf, dest)
         with tarfile.open(archive, "r:*") as tf:
             return _extract_tar(tf, dest)
     except tarfile.TarError as e:
         raise Rejected("无法识别的压缩包格式", f"只支持 zip / tar.gz：{e}")
+    except (zipfile.BadZipFile, EOFError) as e:
+        raise Rejected("压缩包不完整（下载被中断或文件损坏）",
+                       f"{e}\n重跑一次；还不行就手动下载 zip 再传本地路径")
+    except OSError as e:
+        # gzip.BadGzipFile 也是 OSError：既可能是坏包，也可能是磁盘写不进去
+        raise Rejected("解压失败（包损坏，或磁盘空间/权限不足）",
+                       f"{e}\n重跑一次；或先手动下载 zip 再传本地路径")
 
 
 def copy_dir(src: Path, dest: Path) -> dict:
